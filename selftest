@@ -1,0 +1,992 @@
+#!/usr/bin/env bash
+# selftest - build a throwaway IDE server tree and check what ide-server-prune does to it.
+# Touches nothing outside its own temporary directory.
+set -uo pipefail
+
+here=$(cd -- "$(dirname -- "$0")" && pwd -P)
+prune="$here/ide-server-prune"
+work=$(mktemp -d "${TMPDIR:-/tmp}/ide-server-prune-selftest.XXXXXX")
+root="$work/.vscode-server"
+# Everything the tool prints, and every path it compares a process against, has
+# been through pwd -P. On macOS mktemp hands out /var/folders/... which resolves
+# to /private/var/folders/..., so a check that matches its output - or a process
+# whose arguments have to match a root - needs the resolved spelling.
+real_work=$(cd -- "$work" && pwd -P)
+real_root="$real_work/.vscode-server"
+failures=0
+
+A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1
+B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2
+C=ccccccccccccccccccccccccccccccccccccccc3
+D=ddddddddddddddddddddddddddddddddddddddd4
+E=eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee5
+F=fffffffffffffffffffffffffffffffffffffff6
+
+cleanup() { rm -rf -- "$work"; }
+trap cleanup EXIT
+
+check() { # description, path, gone|kept
+    local desc=$1 path=$2 want=$3 have
+    if [ -e "$path" ]; then have=kept; else have=gone; fi
+    if [ "$have" = "$want" ]; then
+        printf '  ok    %s\n' "$desc"
+    else
+        printf '  FAIL  %s (expected %s, got %s)\n' "$desc" "$want" "$have"
+        failures=$(( failures + 1 ))
+    fi
+}
+
+build() {
+    rm -rf -- "$root"
+    local c
+    for c in $A $B $C; do
+        mkdir -p "$root/cli/servers/Stable-$c/server"
+        dd if=/dev/zero of="$root/cli/servers/Stable-$c/server/node" bs=1024 count=64 2>/dev/null
+    done
+    mkdir -p "$root/cli/servers/Stable-$D.staging/server" "$root/bin/$E"
+    printf '["Stable-%s","Stable-%s","Stable-%s"]' $A $B $C >"$root/cli/servers/lru.json"
+    printf 'agent log\n' >"$root/cli/agent-host-stable.log"
+    printf 'lock\n' >"$root/cli/agent-host-stable.lock"
+    for c in $A $C; do printf 'bin\n' >"$root/code-$c"; printf 'log\n' >"$root/.cli.$c.log"; done
+    printf 'log\n' >"$root/.$E.log"; printf '1\n' >"$root/.$E.pid"; printf 't\n' >"$root/.$E.token"
+
+    mkdir -p "$root/data/CachedExtensionVSIXs" "$root/data/CachedData/$A" \
+             "$root/data/CachedData/$E" "$root/data/logs/20200101T000000"
+    printf x >"$root/data/logs/20200101T000000/f"
+
+    mkdir -p "$root/data/User/workspaceStorage/gone" "$root/data/User/workspaceStorage/empty" \
+             "$root/data/User/workspaceStorage/live" "$root/data/User/workspaceStorage/unmounted" \
+             "$root/data/User/workspaceStorage/undecodable"
+    # Deleted from a directory that is still there: the one case where the folder
+    # really is gone rather than merely out of reach. %20 on the way, because a
+    # workspace path arrives percent-encoded.
+    printf '{"folder":"file://%s/gone%%20project"}' "$work" \
+        >"$root/data/User/workspaceStorage/gone/workspace.json"
+    printf '{"folder":"file://%s/not-mounted/project"}' "$work" \
+        >"$root/data/User/workspaceStorage/unmounted/workspace.json"
+    printf '{"folder":"file://%s/100%%done"}' "$work" \
+        >"$root/data/User/workspaceStorage/undecodable/workspace.json"
+    printf '{"folder":"file://%s"}' "$work" >"$root/data/User/workspaceStorage/live/workspace.json"
+
+    mkdir -p "$root/extensions/pub.ext-1.2.3" "$root/extensions/pub.ext-1.10.0" \
+             "$root/extensions/pub.ext-2.0.0-linux-x64" "$root/extensions/pub.old-0.1.0" \
+             "$root/extensions/foo.bar-1.0.0.vsctmp"
+    printf '[{"identifier":{"id":"pub.ext"},"relativeLocation":"pub.ext-1.10.0"}]' \
+        >"$root/extensions/extensions.json"
+    printf '{"pub.old-0.1.0":true}' >"$root/extensions/.obsolete"
+
+    # Everything must look old, or the freshness guard skips it.
+    find "$root" -exec touch -t 202001010000 {} + 2>/dev/null
+}
+
+printf 'ide-server-prune selftest in %s\n\n' "$work"
+
+printf 'dry run changes nothing:\n'
+build
+before=$(find "$root" | sort)
+IDE_CLEAN_TMP=0 "$prune" --dry-run -r "$root" >/dev/null 2>&1
+after=$(find "$root" | sort)
+if [ "$before" = "$after" ]; then printf '  ok    tree untouched\n'; else printf '  FAIL  dry run modified the tree\n'; failures=$(( failures + 1 )); fi
+
+printf '\nreal run:\n'
+build
+IDE_CLEAN_TMP=0 "$prune" -r "$root" >/dev/null 2>&1
+
+check "LRU head kept"                  "$root/cli/servers/Stable-$A"            kept
+check "second LRU entry kept"          "$root/cli/servers/Stable-$B"            kept
+check "third LRU entry pruned"         "$root/cli/servers/Stable-$C"            gone
+check "abandoned .staging pruned"      "$root/cli/servers/Stable-$D.staging"    gone
+check "legacy bin/<commit> pruned"     "$root/bin/$E"                           gone
+check "cli binary of kept version"     "$root/code-$A"                          kept
+check "cli binary of stale version"    "$root/code-$C"                          gone
+check "cli log of kept version"        "$root/.cli.$A.log"                      kept
+check "cli log of stale version"       "$root/.cli.$C.log"                      gone
+check "legacy .<commit>.pid pruned"    "$root/.$E.pid"                          gone
+check "agent host lock untouched"      "$root/cli/agent-host-stable.lock"       kept
+check "stale agent log pruned"         "$root/cli/agent-host-stable.log"        gone
+check "VSIX cache pruned"              "$root/data/CachedExtensionVSIXs"        gone
+check "code cache of kept version"     "$root/data/CachedData/$A"               kept
+check "code cache of stale version"    "$root/data/CachedData/$E"               gone
+check "old session log pruned"         "$root/data/logs/20200101T000000"        gone
+check "storage of missing workspace"   "$root/data/User/workspaceStorage/gone"  gone
+check "empty workspace storage"        "$root/data/User/workspaceStorage/empty" gone
+check "storage of live workspace"      "$root/data/User/workspaceStorage/live"  kept
+check "storage behind a missing parent" "$root/data/User/workspaceStorage/unmounted"   kept
+check "storage with an unreadable path" "$root/data/User/workspaceStorage/undecodable" kept
+check "interrupted extension install"  "$root/extensions/foo.bar-1.0.0.vsctmp"  gone
+check "extension marked obsolete"      "$root/extensions/pub.old-0.1.0"         gone
+check "superseded extension"           "$root/extensions/pub.ext-1.2.3"         gone
+check "extension in extensions.json"   "$root/extensions/pub.ext-1.10.0"        kept
+check "newest extension"               "$root/extensions/pub.ext-2.0.0-linux-x64" kept
+
+expected="[\"Stable-$A\",\"Stable-$B\"]"
+actual=$(cat "$root/cli/servers/lru.json")
+if [ "$actual" = "$expected" ]; then
+    printf '  ok    lru.json filtered to surviving installs\n'
+else
+    printf '  FAIL  lru.json is %s, expected %s\n' "$actual" "$expected"
+    failures=$(( failures + 1 ))
+fi
+
+# An entry pointing at an install that is no longer on disk must not fill a keep
+# slot, or the set stays non-empty, the "keep the newest install" fallback never
+# fires, and every install actually present looks stale.
+printf '\nan lru.json entry whose install is gone does not occupy a keep slot:\n'
+build
+printf '["Stable-%s","Stable-%s"]' $F $A >"$root/cli/servers/lru.json"
+touch -t 202001010000 "$root/cli/servers/lru.json"
+out=$(IDE_CLEAN_TMP=0 "$prune" --dry-run -r "$root" 2>&1)
+keeping=$(printf '%s\n' "$out" | grep '  keeping:' || true)
+case "$keeping" in
+    *"$F"*) printf '  FAIL  kept a commit with no install (%s)\n' "$keeping"; failures=$(( failures + 1 )) ;;
+    *"$A"*) printf '  ok    the slot went to an install that exists\n' ;;
+    *) printf '  FAIL  unexpected keep set (%s)\n' "$keeping"; failures=$(( failures + 1 )) ;;
+esac
+
+printf '\nan lru.json listing nothing that exists falls back to the newest install:\n'
+build
+printf '["Stable-%s"]' $F >"$root/cli/servers/lru.json"
+touch -t 202001010000 "$root/cli/servers/lru.json"
+out=$(IDE_CLEAN_TMP=0 "$prune" --dry-run -r "$root" 2>&1)
+case "$out" in
+    *"keeping: none"*) printf '  FAIL  every install marked stale\n'; failures=$(( failures + 1 )) ;;
+    *"keeping: $F"*)   printf '  FAIL  kept a commit with no install\n'; failures=$(( failures + 1 )) ;;
+    *) printf '  ok    an install that exists is still kept\n' ;;
+esac
+
+# Documented, and worth pinning: 0 empties the keep set outright, so the newest
+# install fallback does not fire either.
+printf '\n--keep 0 keeps nothing but the session:\n'
+build
+out=$(IDE_CLEAN_TMP=0 "$prune" --dry-run --keep 0 -r "$root" 2>&1)
+case "$out" in
+    *"keeping: none"*) printf '  ok    keep set empty\n' ;;
+    *) printf '  FAIL  --keep 0 kept something\n'; failures=$(( failures + 1 )) ;;
+esac
+case "$out" in
+    *"would remove $real_root/cli/servers/Stable-$A"*) printf '  ok    the LRU head is removed too\n' ;;
+    *) printf '  FAIL  the LRU head survived --keep 0\n'; failures=$(( failures + 1 )) ;;
+esac
+
+# An empty array is what this tool itself writes once the last install is gone,
+# and grep reports a file with no matches with a non-zero status. Under pipefail
+# that status used to become the assignment's and end the run mid-sweep - so from
+# the second run onwards every pass after lru.json was silently skipped.
+printf '\nan empty lru.json does not cut the run short:\n'
+build
+printf '[]' >"$root/cli/servers/lru.json"
+touch -t 202001010000 "$root/cli/servers/lru.json"
+out=$(IDE_CLEAN_TMP=0 "$prune" -r "$root" 2>&1)
+case "$out" in
+    *"freed"*) printf '  ok    the sweep reached its summary\n' ;;
+    *) printf '  FAIL  the run stopped early (%s)\n' "$out"; failures=$(( failures + 1 )) ;;
+esac
+check "a later pass still ran" "$root/extensions/pub.old-0.1.0" gone
+
+# The same failure mode from the other side: reading the file, not grepping it.
+# The read is a plain assignment, so under set -e its status ends the run - and
+# writability was asked about while readability was not, which left a file we
+# could write but not read aborting the sweep before its summary. Skipped as
+# root, where mode 200 keeps nothing out.
+printf '\nan unreadable lru.json does not cut the run short:\n'
+if [ "$(id -u)" -eq 0 ]; then
+    printf '  skip  running as root, mode 200 is no obstacle\n'
+else
+    build
+    chmod 200 "$root/cli/servers/lru.json"
+    out=$(IDE_CLEAN_TMP=0 "$prune" -r "$root" 2>&1 || true)
+    chmod 600 "$root/cli/servers/lru.json"
+    case "$out" in
+        *"freed"*) printf '  ok    the sweep reached its summary\n' ;;
+        *) printf '  FAIL  the run stopped at lru.json (%s)\n' "$out"
+           failures=$(( failures + 1 )) ;;
+    esac
+    check "a later pass still ran" "$root/extensions/pub.old-0.1.0" gone
+fi
+
+# The same thing, reached the way a host actually reaches it.
+printf '\nthe run after a --keep 0 clean slate still completes:\n'
+build
+IDE_CLEAN_TMP=0 "$prune" -q --keep 0 -r "$root" >/dev/null 2>&1
+if IDE_CLEAN_TMP=0 "$prune" -q -r "$root" >/dev/null 2>&1; then
+    printf '  ok    completed\n'
+else
+    printf '  FAIL  the run after --keep 0 exits non-zero\n'; failures=$(( failures + 1 ))
+fi
+
+printf '\nlru.json in an unknown format is left alone:\n'
+build
+printf '{"servers":["Stable-%s"]}' $A >"$root/cli/servers/lru.json"
+IDE_CLEAN_TMP=0 "$prune" -q -r "$root" >/dev/null 2>&1
+if [ "$(cat "$root/cli/servers/lru.json")" = "{\"servers\":[\"Stable-$A\"]}" ]; then
+    printf '  ok    left untouched\n'
+else
+    printf '  FAIL  rewrote an lru.json it does not understand\n'
+    failures=$(( failures + 1 ))
+fi
+
+# Isolated HOME, so the check can never disturb a lock held by a real run.
+printf '\nrun in progress is refused:\n'
+mkdir -p "$work/home/.cache"
+lock="$work/home/.cache/.ide-server-prune.lock"
+mkdir -p "$lock" && printf '%s\n' "$$" >"$lock/pid"
+if env HOME="$work/home" XDG_RUNTIME_DIR= XDG_CACHE_HOME= IDE_CLEAN_TMP=0 \
+        "$prune" -q -r "$root" >/dev/null 2>&1; then
+    printf '  FAIL  ran while another instance held the lock\n'
+    failures=$(( failures + 1 ))
+else
+    printf '  ok    refused\n'
+fi
+rm -rf -- "$lock"
+
+printf '\nstale lock is taken over:\n'
+mkdir -p "$lock" && printf '999999\n' >"$lock/pid"
+if env HOME="$work/home" XDG_RUNTIME_DIR= XDG_CACHE_HOME= IDE_CLEAN_TMP=0 \
+        "$prune" -q -r "$root" >/dev/null 2>&1; then
+    printf '  ok    took over\n'
+else
+    printf '  FAIL  refused to run behind a dead lock holder\n'
+    failures=$(( failures + 1 ))
+fi
+
+# A symlinked parent inside the tree must not redirect a removal out of it.
+printf '\nremoval outside the resolved root is refused:\n'
+build
+rm -rf "$work/outside"
+mkdir -p "$work/outside/Stable-$C/server" "$work/outside/Stable-$A"
+printf 'precious\n' >"$work/outside/Stable-$C/keepme"
+# The kept entry has to exist behind the link as well: an lru.json naming an
+# install that is not there no longer occupies a keep slot, and with nothing
+# left to remove the refusal under test would never be reached.
+printf '["Stable-%s"]' $A >"$work/outside/lru.json"
+rm -rf "$root/cli/servers"
+ln -s "$work/outside" "$root/cli/servers"
+find "$work/outside" -exec touch -t 202001010000 {} + 2>/dev/null
+out=$(IDE_CLEAN_TMP=0 "$prune" -r "$root" 2>&1)
+check "target behind a symlinked parent" "$work/outside/Stable-$C/keepme" kept
+case "$out" in
+    *"refusing to remove outside known roots"*) printf '  ok    and it says so\n' ;;
+    *) printf '  FAIL  no refusal reported\n'; failures=$(( failures + 1 )) ;;
+esac
+
+# A name read out of .obsolete must not be able to walk up out of extensions/.
+printf '\ndirectory traversal from .obsolete is refused:\n'
+build
+mkdir -p "$work/outside"
+printf 'precious\n' >"$work/outside/keepme"
+printf '{"../../../outside":true}' >"$root/extensions/.obsolete"
+touch -t 202001010000 "$root/extensions/.obsolete"
+out=$(IDE_CLEAN_TMP=0 "$prune" -r "$root" 2>&1)
+check "target above the extensions dir" "$work/outside/keepme" kept
+case "$out" in
+    *"suspicious .obsolete entry"*) printf '  ok    and it says so\n' ;;
+    *) printf '  FAIL  no refusal reported\n'; failures=$(( failures + 1 )) ;;
+esac
+
+# A root named by hand -- --root or IDE_SERVER_ROOTS -- has to look like a server
+# tree, or a typo would aim the whole run at something unrelated.
+printf '\na root that is not a server tree is refused:\n'
+mkdir -p "$work/notaserver/data/logs"
+out=$(IDE_CLEAN_TMP=0 "$prune" -r "$work/notaserver" 2>&1 || true)
+case "$out" in
+    *"does not look like an IDE server root"*) printf '  ok    --root refused\n' ;;
+    *) printf '  FAIL  --root accepted a foreign directory\n'; failures=$(( failures + 1 )) ;;
+esac
+out=$(IDE_CLEAN_TMP=0 IDE_SERVER_ROOTS="$work/notaserver" "$prune" 2>&1 || true)
+case "$out" in
+    *"does not look like an IDE server root"*) printf '  ok    IDE_SERVER_ROOTS refused\n' ;;
+    *) printf '  FAIL  IDE_SERVER_ROOTS accepted a foreign directory\n'; failures=$(( failures + 1 )) ;;
+esac
+
+# bin plus data is an ordinary shape for a directory to have. Auto-detection
+# reaches every ~/.*-server by name, so a tree carrying nothing else of an IDE
+# about it must not be adopted - the caches and data/logs passes are
+# unconditional, and would sweep a stranger's logs on the next run.
+printf '\na ~/.*-server that is not an IDE tree is not adopted:\n'
+rm -rf "$work/fakehome"
+mkdir -p "$work/fakehome/.myapp-server/bin" "$work/fakehome/.myapp-server/data/logs/old"
+printf 'precious\n' >"$work/fakehome/.myapp-server/data/logs/old/app.log"
+find "$work/fakehome" -exec touch -t 202001010000 {} + 2>/dev/null
+out=$(env HOME="$work/fakehome" IDE_CLEAN_TMP=0 "$prune" --dry-run 2>&1 || true)
+check "logs of a foreign ~/.*-server" "$work/fakehome/.myapp-server/data/logs/old/app.log" kept
+case "$out" in
+    *"no IDE server roots found"*) printf '  ok    not adopted\n' ;;
+    *) printf '  FAIL  adopted a foreign tree (%s)\n' "$out"; failures=$(( failures + 1 )) ;;
+esac
+# The legacy layout has no cli/servers to be recognised by, so it is recognised
+# by the marks the editor does leave beside it. That has to keep working.
+mkdir -p "$work/fakehome/.myapp-server/data/User"
+find "$work/fakehome" -exec touch -t 202001010000 {} + 2>/dev/null
+out=$(env HOME="$work/fakehome" IDE_CLEAN_TMP=0 "$prune" --dry-run 2>&1 || true)
+case "$out" in
+    *"no IDE server roots found"*)
+        printf '  FAIL  a legacy tree with data/User is no longer recognised\n'
+        failures=$(( failures + 1 )) ;;
+    *) printf '  ok    a legacy tree with data/User still is\n' ;;
+esac
+
+printf '\na root with no installs and no lru.json is not fatal:\n'
+mkdir -p "$work/bare/cli/servers"
+if IDE_CLEAN_TMP=0 "$prune" -q -r "$work/bare" >/dev/null 2>&1; then
+    printf '  ok    completed\n'
+else
+    printf '  FAIL  exited non-zero on an empty root\n'
+    failures=$(( failures + 1 ))
+fi
+
+# /tmp is a symlink to /private/tmp on macOS; find will not descend into a
+# symlinked starting point, so the temp pass has to resolve it first.
+printf '\na symlinked temp directory is resolved:\n'
+mkdir -p "$work/realtmp/vscode-stale"
+touch -t 202001010000 "$work/realtmp/vscode-stale"
+ln -s "$work/realtmp" "$work/tmplink"
+out=$(TMPDIR="$work/tmplink" "$prune" --dry-run -r "$root" 2>&1)
+case "$out" in
+    *"$real_work/realtmp/vscode-stale"*) printf '  ok    scanned through the symlink\n' ;;
+    *) printf '  FAIL  temp entry behind a symlinked TMPDIR not seen\n'; failures=$(( failures + 1 )) ;;
+esac
+
+printf '\na tunable that is not a number is refused, not ignored:\n'
+refuses() { # env assignment - has to fail, and has to name the variable
+    local assignment=$1 name=${1%%=*} out rc=0
+    out=$(env "$assignment" IDE_CLEAN_TMP=0 "$prune" --dry-run -r "$root" 2>&1) || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        printf '  FAIL  %s accepted\n' "$assignment"; failures=$(( failures + 1 )); return
+    fi
+    case "$out" in
+        *"$name"*) printf '  ok    %s refused\n' "$assignment" ;;
+        *) printf '  FAIL  %s refused without naming it\n' "$assignment"; failures=$(( failures + 1 )) ;;
+    esac
+}
+accepts() { # env assignment - empty means "use the default", wider patterns are the caller's call
+    local assignment=$1
+    if env "$assignment" IDE_CLEAN_TMP=0 "$prune" --dry-run -r "$root" >/dev/null 2>&1; then
+        printf '  ok    %s accepted\n' "$assignment"
+    else
+        printf '  FAIL  %s rejected\n' "$assignment"; failures=$(( failures + 1 ))
+    fi
+}
+build
+refuses IDE_FRESH_GUARD_MINUTES=abc
+refuses IDE_STAGING_MIN_AGE_HOURS=abc
+refuses IDE_KILL_GRACE_SECONDS=1.5
+refuses IDE_WORKSPACE_MIN_AGE_DAYS=-1
+refuses IDE_PROTECT_LIVE=yes
+refuses IDE_CLEAN_EXTENSIONS=true
+refuses 'IDE_TMP_PATTERNS=*'
+refuses 'IDE_TMP_PATTERNS=../vscode-*'
+accepts IDE_LOG_RETENTION_DAYS=
+accepts 'IDE_TMP_PATTERNS=code-* mcp-*'
+
+# --install writes tunables into a unit one per line, so a value carrying a
+# newline would be split there into a second, bogus entry.
+printf '\na tunable carrying a newline is refused:\n'
+out=$(env "IDE_SERVER_ROOTS=$(printf '%s\nIDE_INJECTED' "$root")" IDE_CLEAN_TMP=0 \
+          "$prune" --dry-run 2>&1 || true)
+case "$out" in
+    *"must not contain a newline"*) printf '  ok    refused\n' ;;
+    *) printf '  FAIL  accepted a multi-line value\n'; failures=$(( failures + 1 )) ;;
+esac
+
+# The freshness guard is the one that used to fail open: find -mmin -abc matches
+# nothing, so a brand new install looked stale.
+printf '\nthe freshness guard still holds for a fresh install:\n'
+build
+touch "$root/cli/servers/Stable-$C"
+out=$(IDE_CLEAN_TMP=0 "$prune" --dry-run -r "$root" 2>&1)
+case "$out" in
+    *"skipping fresh install"*) printf '  ok    fresh install skipped\n' ;;
+    *) printf '  FAIL  fresh install not protected\n'; failures=$(( failures + 1 )) ;;
+esac
+
+# A staging directory is never in the keep set, so its own age guard is all a
+# download in flight has - and the transfer writes inside it, not to it.
+printf '\na download still being written is left alone:\n'
+build
+mkdir -p "$root/cli/servers/Stable-$F.staging/server"
+touch -t 202001010000 "$root/cli/servers/Stable-$F.staging" \
+                      "$root/cli/servers/Stable-$F.staging/server"
+printf 'partial\n' >"$root/cli/servers/Stable-$F.staging/server/vscode-server.tar.gz"
+IDE_CLEAN_TMP=0 "$prune" -r "$root" >/dev/null 2>&1
+check "staging directory being written" "$root/cli/servers/Stable-$F.staging" kept
+check "abandoned staging still pruned"  "$root/cli/servers/Stable-$D.staging" gone
+
+# Background jobs need their own process group, or the pruner - which skips its
+# own - would filter them out and the two checks below would pass vacuously.
+own_pgid() { ps -o pgid= -p "$1" 2>/dev/null | tr -d ' '; }
+stop_job() { # pid - a job started under set -m, so it owns its process group
+    local pg
+    pg=$(own_pgid "$1")
+    [ -n "$pg" ] && kill -KILL -"$pg" 2>/dev/null
+    kill -KILL "$1" 2>/dev/null
+    wait "$1" 2>/dev/null
+    return 0
+}
+
+# A plain background job stays in *our* process group, so stop_job would take
+# this script down with it. Nothing here needs a group of its own: these hold a
+# descriptor open for path_in_use, they are not processes the pruner has to see.
+stop_holder() { # pid
+    kill -KILL "$1" 2>/dev/null
+    wait "$1" 2>/dev/null
+    return 0
+}
+
+# Stable-<commit> is a prefix of Stable-<commit>.staging: removing the finished
+# install must not take the download meant to replace it down with it.
+printf '\na download in flight survives the removal of its predecessor:\n'
+build
+mkdir -p "$root/cli/servers/Stable-$F.staging/server"
+printf '#!/bin/sh\nsleep 30\n' >"$root/cli/servers/Stable-$F.staging/server/download"
+chmod 755 "$root/cli/servers/Stable-$F.staging/server/download"
+mkdir -p "$root/cli/servers/Stable-$F"
+touch -t 202001010000 "$root/cli/servers/Stable-$F"
+set -m
+"$real_root/cli/servers/Stable-$F.staging/server/download" >/dev/null 2>&1 &
+downloader=$!
+set +m
+sleep 1
+if [ -n "$(own_pgid "$downloader")" ] && [ "$(own_pgid "$downloader")" != "$(own_pgid $$)" ]; then
+    out=$(IDE_CLEAN_TMP=0 "$prune" --dry-run --no-protect-live -r "$root" 2>&1)
+    case "$out" in
+        *"would terminate pids"*)
+            printf '  FAIL  the downloader was targeted (%s)\n' \
+                "$(printf '%s\n' "$out" | grep 'would terminate' || true)"
+            failures=$(( failures + 1 )) ;;
+        *) printf '  ok    downloader left alone\n' ;;
+    esac
+    case "$out" in
+        *"would remove $real_root/cli/servers/Stable-$F  "*)
+            printf '  ok    its predecessor still pruned\n' ;;
+        *) printf '  FAIL  the stale install was not pruned\n'; failures=$(( failures + 1 )) ;;
+    esac
+else
+    printf '  skip  no job control here\n'
+fi
+stop_job "$downloader"
+
+# A staging directory is never in the keep set - no commit is recorded for a
+# version nobody could start yet - so PROTECT_LIVE has nothing to hold it by and
+# the path itself has to be asked about. Without that, an unattended sweep
+# terminates a transfer that has merely stalled.
+printf '\na stalled download with a live process survives --protect-live:\n'
+build
+mkdir -p "$root/cli/servers/Stable-$F.staging/server"
+printf '#!/bin/sh\nsleep 30\n' >"$root/cli/servers/Stable-$F.staging/server/download"
+chmod 755 "$root/cli/servers/Stable-$F.staging/server/download"
+find "$root/cli/servers/Stable-$F.staging" -exec touch -t 202001010000 {} + 2>/dev/null
+set -m
+"$real_root/cli/servers/Stable-$F.staging/server/download" >/dev/null 2>&1 &
+stalled=$!
+set +m
+sleep 1
+if [ -n "$(own_pgid "$stalled")" ] && [ "$(own_pgid "$stalled")" != "$(own_pgid $$)" ]; then
+    out=$(IDE_CLEAN_TMP=0 "$prune" --dry-run --protect-live -r "$root" 2>&1)
+    case "$out" in
+        *"skipping live download"*) printf '  ok    left alone\n' ;;
+        *) printf '  FAIL  a live download was targeted under --protect-live\n'
+           failures=$(( failures + 1 )) ;;
+    esac
+    # And it is only the flag doing that, not the age guard quietly skipping the
+    # whole candidate - or the check above would pass without protecting anything.
+    out=$(IDE_CLEAN_TMP=0 "$prune" --dry-run --no-protect-live -r "$root" 2>&1)
+    case "$out" in
+        *"would remove $real_root/cli/servers/Stable-$F.staging"*)
+            printf '  ok    and --no-protect-live still sweeps it\n' ;;
+        *) printf '  FAIL  the stalled download was not swept without the flag\n'
+           failures=$(( failures + 1 )) ;;
+    esac
+else
+    printf '  skip  no job control here\n'
+fi
+stop_job "$stalled"
+
+# The legacy layout names a directory after the bare commit, with none of the
+# Name- prefix the modern one carries; a pattern asking only for the latter never
+# matches a legacy orphan at all.
+printf '\nan orphan process from the legacy bin/<commit> layout is swept:\n'
+build
+mkdir -p "$root/bin/$F"
+printf '#!/bin/sh\nsleep 30\n' >"$root/bin/$F/node"
+chmod 755 "$root/bin/$F/node"
+set -m
+"$real_root/bin/$F/node" >/dev/null 2>&1 &
+orphan=$!
+set +m
+sleep 1
+rm -rf "$root/bin/$F"
+if [ -n "$(own_pgid "$orphan")" ] && [ "$(own_pgid "$orphan")" != "$(own_pgid $$)" ]; then
+    out=$(IDE_CLEAN_TMP=0 "$prune" --dry-run --no-protect-live -r "$root" 2>&1)
+    case "$out" in
+        *"orphan process"*) printf '  ok    reported\n' ;;
+        *) printf '  FAIL  legacy orphan not seen\n'; failures=$(( failures + 1 )) ;;
+    esac
+else
+    printf '  skip  no job control here\n'
+fi
+stop_job "$orphan"
+
+# Reporting an orphan is not sweeping one. The signalling used to sit inside the
+# loop with a hard one-second pause, which both ignored IDE_KILL_GRACE_SECONDS
+# and served that pause once per orphan.
+printf '\nan orphan process is actually signalled:\n'
+build
+mkdir -p "$root/bin/$F"
+printf '#!/bin/sh\nsleep 30\n' >"$root/bin/$F/node"
+chmod 755 "$root/bin/$F/node"
+set -m
+"$real_root/bin/$F/node" >/dev/null 2>&1 &
+orphan2=$!
+set +m
+sleep 1
+rm -rf "$root/bin/$F"
+if [ -n "$(own_pgid "$orphan2")" ] && [ "$(own_pgid "$orphan2")" != "$(own_pgid $$)" ]; then
+    # This is the one job the pruner is meant to kill, and bash announces the
+    # death of a job it started under set -m on stderr, before the next command
+    # runs. The checks themselves print to stdout, so silencing stderr across
+    # the two commands that straddle the announcement keeps the report clean
+    # without hiding anything a check would have said.
+    {
+        IDE_CLEAN_TMP=0 IDE_KILL_GRACE_SECONDS=2 "$prune" --no-protect-live -r "$root" >/dev/null 2>&1
+        # kill -0 succeeds on a zombie, and this one is our own child - so ask
+        # for the state rather than for existence.
+        state=$(ps -o state= -p "$orphan2" 2>/dev/null | tr -d ' ')
+    } 2>/dev/null
+    case "$state" in
+        ''|Z*) printf '  ok    swept\n' ;;
+        *) printf '  FAIL  the orphan survived (state %s)\n' "$state"
+           failures=$(( failures + 1 )) ;;
+    esac
+else
+    printf '  skip  no job control here\n'
+fi
+stop_job "$orphan2"
+
+# An orphan is a process with no install left, not a process that merely names
+# one. Reading only the first path out of its arguments made a live server whose
+# argv happens to mention a tree an earlier run removed - before the tree it is
+# actually running out of - look like an orphan, and the sweep meant to clean up
+# after dead sessions killed a live one. The launcher lives outside the tree so
+# that the removed path comes first in argv, which is the ordering that breaks it.
+printf '\na process that also names a live install is not an orphan:\n'
+build
+mkdir -p "$root/bin/$F"
+printf '#!/bin/sh\nsleep 30\n' >"$work/launcher"
+chmod 755 "$work/launcher"
+set -m
+"$work/launcher" "$real_root/bin/$F/node" \
+    "$real_root/cli/servers/Stable-$A/server/node" >/dev/null 2>&1 &
+mixed=$!
+set +m
+sleep 1
+rm -rf "$root/bin/$F"
+if [ -n "$(own_pgid "$mixed")" ] && [ "$(own_pgid "$mixed")" != "$(own_pgid $$)" ]; then
+    out=$(IDE_CLEAN_TMP=0 "$prune" --dry-run --no-protect-live -r "$root" 2>&1)
+    case "$out" in
+        *"orphan process $mixed"*)
+            printf '  FAIL  a process running from a live install was swept\n'
+            failures=$(( failures + 1 )) ;;
+        *) printf '  ok    left alone\n' ;;
+    esac
+else
+    printf '  skip  no job control here\n'
+fi
+stop_job "$mixed"
+
+# A session log directory older than the retention window can still belong to a
+# session that has simply been up longer than that. The CLI logs beside it have
+# always been asked whether anything holds them open; these had not been.
+printf '\na log directory something still writes to is kept:\n'
+build
+mkdir -p "$root/data/logs/20200101T000001"
+printf 'x\n' >"$root/data/logs/20200101T000001/live.log"
+touch -t 202001010000 "$root/data/logs/20200101T000001" \
+                      "$root/data/logs/20200101T000001/live.log"
+( exec 9>>"$real_root/data/logs/20200101T000001/live.log"; sleep 30 ) &
+holder=$!
+sleep 1
+IDE_CLEAN_TMP=0 "$prune" -r "$root" >/dev/null 2>&1
+check "log directory held open"     "$root/data/logs/20200101T000001" kept
+check "log directory nobody holds"  "$root/data/logs/20200101T000000" gone
+stop_holder "$holder"
+
+# A signal is as irreversible as a removal, so the containment check has to be
+# asked before it and not only before the rm: a stale install is terminated
+# first and deleted after, and a target behind a symlinked parent used to be
+# signalled on the way to a removal that was then refused.
+printf '\nnothing is signalled for a target the containment check refuses:\n'
+build
+rm -rf "$work/outside"
+mkdir -p "$work/outside/Stable-$C" "$work/outside/Stable-$A"
+printf '["Stable-%s"]' $A >"$work/outside/lru.json"
+printf '#!/bin/sh\nsleep 30\n' >"$work/outside/Stable-$C/node"
+chmod 755 "$work/outside/Stable-$C/node"
+rm -rf "$root/cli/servers"
+ln -s "$work/outside" "$root/cli/servers"
+find "$work/outside" -exec touch -t 202001010000 {} + 2>/dev/null
+set -m
+"$real_root/cli/servers/Stable-$C/node" >/dev/null 2>&1 &
+victim=$!
+set +m
+sleep 1
+if [ -n "$(own_pgid "$victim")" ] && [ "$(own_pgid "$victim")" != "$(own_pgid $$)" ]; then
+    out=$(IDE_CLEAN_TMP=0 IDE_KILL_GRACE_SECONDS=1 "$prune" --no-protect-live -r "$root" 2>&1 || true)
+    if kill -0 "$victim" 2>/dev/null; then
+        printf '  ok    left alone\n'
+    else
+        printf '  FAIL  signalled a process whose removal was then refused\n'
+        failures=$(( failures + 1 ))
+    fi
+    case "$out" in
+        *"refusing to remove outside known roots"*) printf '  ok    and the removal is still refused\n' ;;
+        *) printf '  FAIL  no refusal reported\n'; failures=$(( failures + 1 )) ;;
+    esac
+else
+    printf '  skip  no job control here\n'
+fi
+stop_job "$victim"
+
+# GNU stat reads -f as --file-system, where %m is not a directive it knows: it
+# answers "?" and still exits 0. Asking it that way first would shadow the
+# spelling it does understand, and an mtime of 0 for everything takes the last
+# fallback - "keep the newest install" - down with it.
+printf '\nthe newest install is found with a GNU-style stat:\n'
+mkdir -p "$work/gnu"
+cat >"$work/gnu/stat" <<'STUB'
+#!/bin/sh
+# Stands in for a stat that answers the GNU spelling and nothing else. The
+# answer to -c %Y has to be a real mtime on whichever host is running this, so
+# it is asked for both ways: delegating only to the BSD spelling answers nothing
+# on Linux, where -f is --file-system and %m is not a directive it knows - and
+# the test would then fail on GNU coreutils, which is the very thing it is here
+# to check.
+case $1 in
+    -c) shift
+        case ${1:-} in
+            '%Y') shift
+                  /usr/bin/stat -c '%Y' -- "$@" 2>/dev/null && exit 0
+                  exec /usr/bin/stat -f '%m' "$@" ;;
+        esac
+        exit 1 ;;
+    -f) printf '?\n'; exit 0 ;;
+esac
+exec /usr/bin/stat "$@"
+STUB
+printf '#!/bin/sh\nexit 1\n' >"$work/gnu/blind"
+chmod 755 "$work/gnu/stat" "$work/gnu/blind"
+if [ -x /usr/bin/stat ]; then
+    build
+    rm -f "$root/cli/servers/lru.json"
+    touch -t 202401010000 "$root/cli/servers/Stable-$B"
+    out=$(env PATH="$work/gnu:$PATH" IDE_CLEAN_TMP=0 "$prune" --dry-run -r "$root" 2>&1)
+    case "$out" in
+        *"keeping: $B"*) printf '  ok    newest install kept\n' ;;
+        *) printf '  FAIL  newest install not identified (keeping line: %s)\n' \
+               "$(printf '%s\n' "$out" | grep keeping || true)"
+           failures=$(( failures + 1 )) ;;
+    esac
+
+    # And with no readable mtime at all the fallback still has to answer.
+    printf '\nno readable mtime keeps an install anyway:\n'
+    cp "$work/gnu/blind" "$work/gnu/stat"
+    build
+    rm -f "$root/cli/servers/lru.json"
+    out=$(env PATH="$work/gnu:$PATH" IDE_CLEAN_TMP=0 "$prune" --dry-run -r "$root" 2>&1)
+    case "$out" in
+        *"keeping: none"*)
+            printf '  FAIL  every install marked stale\n'; failures=$(( failures + 1 )) ;;
+        *) printf '  ok    an install is still kept\n' ;;
+    esac
+else
+    printf '  skip  no /usr/bin/stat to wrap\n'
+fi
+
+printf '\nsudo is refused, plain root is not:\n'
+build
+out=$(env SUDO_USER=someone IDE_CLEAN_TMP=0 "$prune" --dry-run -r "$root" 2>&1 || true)
+case "$out" in
+    *"not through sudo"*) printf '  ok    refused under sudo\n' ;;
+    *) printf '  FAIL  ran under sudo\n'; failures=$(( failures + 1 )) ;;
+esac
+if IDE_CLEAN_TMP=0 "$prune" -q --dry-run -r "$root" >/dev/null 2>&1; then
+    printf '  ok    ordinary run unaffected\n'
+else
+    printf '  FAIL  ordinary run refused too\n'; failures=$(( failures + 1 ))
+fi
+
+# TMPDIR becomes a removal root for the rest of the run, so it answers the same
+# question a server root does.
+printf '\nan unsuitable temp directory is refused:\n'
+mkdir -p "$work/home"
+out=$(env HOME="$work/home" TMPDIR="$work/home" IDE_CLEAN_WORKSPACE_STORAGE=0 \
+          "$prune" --dry-run -r "$root" 2>&1 || true)
+case "$out" in
+    *"ignoring unsuitable temp directory"*) printf '  ok    TMPDIR=$HOME ignored\n' ;;
+    *) printf '  FAIL  swept $HOME as a temp directory\n'; failures=$(( failures + 1 )) ;;
+esac
+# A length test alone lets /var and /usr through; what matters is that the
+# directory must not contain the home it would then sweep names out of.
+mkdir -p "$work/home/inner"
+out=$(env HOME="$work/home/inner" TMPDIR="$work/home" IDE_CLEAN_WORKSPACE_STORAGE=0 \
+          "$prune" --dry-run -r "$root" 2>&1 || true)
+case "$out" in
+    *'contains $HOME'*) printf '  ok    a TMPDIR above $HOME ignored\n' ;;
+    *) printf '  FAIL  swept a temp directory containing $HOME\n'; failures=$(( failures + 1 )) ;;
+esac
+# A server root has a structure to be recognised by; a temp directory has none,
+# so a system path in TMPDIR is refused by name. The length test alone let every
+# one of these through.
+out=$(env TMPDIR=/usr IDE_CLEAN_WORKSPACE_STORAGE=0 "$prune" --dry-run -r "$root" 2>&1 || true)
+case "$out" in
+    *"ignoring unsuitable temp directory: /usr"*) printf '  ok    TMPDIR=/usr ignored\n' ;;
+    *) printf '  FAIL  accepted /usr as a temp directory\n'; failures=$(( failures + 1 )) ;;
+esac
+
+# TMPDIR and /tmp are very often the same directory, and the pass looks at both.
+# Remembering one only after the screen meant a directory the screen refuses was
+# named once per spelling rather than once. $HOME is what makes /tmp refusable
+# here - no other screen turns it down - and it is also the comparison the two
+# platforms disagree about, since /tmp resolves to /private/tmp on macOS and to
+# itself on Linux. Both spellings are refused, so the sweep is handed nothing to
+# walk; --dry-run is the second belt. The lock hangs off $HOME, and XDG_CACHE_HOME
+# keeps it out of the shared /tmp this hands the script as a home.
+printf '\na temp directory reached twice is refused once:\n'
+out=$(env HOME=/tmp TMPDIR=/tmp XDG_CACHE_HOME="$work/cache" \
+          IDE_CLEAN_WORKSPACE_STORAGE=0 "$prune" --dry-run -r "$root" 2>&1 || true)
+refusals=$(grep -c "ignoring unsuitable temp directory" <<<"$out" || true)
+case "$refusals" in
+    1) printf '  ok    named once\n' ;;
+    *) printf '  FAIL  refused %s times, expected 1\n' "$refusals"
+       failures=$(( failures + 1 )) ;;
+esac
+
+# Every root, guard and the lock itself hang off $HOME; without one the script
+# used to fail with a bare "unbound variable" from the middle of the file.
+printf '\nan unusable HOME is named rather than stumbled over:\n'
+out=$(env -u HOME IDE_CLEAN_TMP=0 "$prune" --dry-run -r "$root" 2>&1 || true)
+case "$out" in
+    *"HOME must name an existing directory"*) printf '  ok    unset HOME refused\n' ;;
+    *) printf '  FAIL  unset HOME (%s)\n' "$out"; failures=$(( failures + 1 )) ;;
+esac
+out=$(env HOME="$work/no-such-home" IDE_CLEAN_TMP=0 "$prune" --dry-run -r "$root" 2>&1 || true)
+case "$out" in
+    *"HOME must name an existing directory"*) printf '  ok    missing HOME refused\n' ;;
+    *) printf '  FAIL  missing HOME (%s)\n' "$out"; failures=$(( failures + 1 )) ;;
+esac
+
+# The temp sweep promises to remove nothing a process still holds open. Reading
+# lsof's exit status did not deliver that for a directory: +D exits non-zero
+# after a walk it completed perfectly well, and "nothing open" reports the same
+# status - so on every host without /proc each candidate directory looked free.
+printf '\na temp directory something still holds open is kept:\n'
+held_tmp="$work/tmpheld"
+mkdir -p "$held_tmp/vscode-held" "$held_tmp/vscode-free"
+printf 'x\n' >"$held_tmp/vscode-held/open.sock.log"
+printf 'x\n' >"$held_tmp/vscode-free/closed.log"
+find "$held_tmp" -exec touch -t 202001010000 {} + 2>/dev/null
+real_held=$(cd -- "$held_tmp" && pwd -P)
+( exec 9>>"$real_held/vscode-held/open.sock.log"; sleep 30 ) &
+holder2=$!
+sleep 1
+TMPDIR="$held_tmp" IDE_CLEAN_WORKSPACE_STORAGE=0 "$prune" -r "$root" >/dev/null 2>&1
+check "temp directory held open"    "$held_tmp/vscode-held" kept
+check "temp directory nobody holds" "$held_tmp/vscode-free" gone
+stop_holder "$holder2"
+
+# find splits its output on newlines unless asked otherwise, and a name carrying
+# one would arrive as two paths, neither of which is the file.
+printf '\na temp name with a newline in it is still removed:\n'
+nl_dir="$work/tmpnl"
+mkdir -p "$nl_dir"
+nl_name=$(printf 'vscode-a\nb')
+printf 'x\n' >"$nl_dir/$nl_name"
+touch -t 202001010000 "$nl_dir/$nl_name"
+TMPDIR="$nl_dir" IDE_CLEAN_WORKSPACE_STORAGE=0 "$prune" -r "$root" >/dev/null 2>&1
+check "temp name containing a newline" "$nl_dir/$nl_name" gone
+
+# du -s breaks its line on a name containing a newline, so reading the last line
+# of that output measured every such path as nothing. The root here is one the
+# run has no reason to touch, or a removal from it would mask the zero.
+printf '\na temp name with a newline is measured, not counted as zero:\n'
+mkdir -p "$work/nlroot/cli/servers/Stable-$A"
+printf '["Stable-%s"]' $A >"$work/nlroot/cli/servers/lru.json"
+nl_dir2="$work/tmpnl2"
+mkdir -p "$nl_dir2/$(printf 'vscode-c\nd')"
+dd if=/dev/zero of="$nl_dir2/$(printf 'vscode-c\nd')/blob" bs=1024 count=64 2>/dev/null
+find "$work/nlroot" "$nl_dir2" -exec touch -t 202001010000 {} + 2>/dev/null
+out=$(TMPDIR="$nl_dir2" IDE_CLEAN_WORKSPACE_STORAGE=0 "$prune" --dry-run \
+          -r "$work/nlroot" 2>&1)
+case "$out" in
+    *"would free 0 KB"*) printf '  FAIL  measured as nothing\n'; failures=$(( failures + 1 )) ;;
+    *"would free"*)      printf '  ok    measured\n' ;;
+    *) printf '  FAIL  no summary line (%s)\n' "$out"; failures=$(( failures + 1 )) ;;
+esac
+
+# Version-aware sorting is not POSIX, and busybox accepts -V while ignoring it -
+# under which 1.10.0 reads as older than 1.9.0 and the newest version is the one
+# that looks superseded.
+printf '\nextension versions are left alone without a version-aware sort:\n'
+mkdir -p "$work/nosort"
+cat >"$work/nosort/sort" <<'STUB'
+#!/bin/sh
+for a in "$@"; do
+    case $a in -*V*) exit 2 ;; esac
+done
+exec /usr/bin/sort "$@"
+STUB
+chmod 755 "$work/nosort/sort"
+if [ -x /usr/bin/sort ]; then
+    build
+    out=$(env PATH="$work/nosort:$PATH" IDE_CLEAN_TMP=0 "$prune" -r "$root" 2>&1)
+    check "older version kept" "$root/extensions/pub.ext-1.2.3" kept
+    case "$out" in
+        *"no version-aware sort"*) printf '  ok    and it says so\n' ;;
+        *) printf '  FAIL  degraded silently\n'; failures=$(( failures + 1 )) ;;
+    esac
+else
+    printf '  skip  no /usr/bin/sort to wrap\n'
+fi
+
+printf '\nextension versions are left alone without a usable manifest:\n'
+build
+rm -f "$root/extensions/extensions.json"
+IDE_CLEAN_TMP=0 "$prune" -r "$root" >/dev/null 2>&1
+check "older version kept"    "$root/extensions/pub.ext-1.2.3"  kept
+check "newer version kept"    "$root/extensions/pub.ext-1.10.0" kept
+check "obsolete still pruned" "$root/extensions/pub.old-0.1.0"  gone
+
+build
+printf '{"truncated' >"$root/extensions/extensions.json"
+touch -t 202001010000 "$root/extensions/extensions.json"
+IDE_CLEAN_TMP=0 "$prune" -r "$root" >/dev/null 2>&1
+check "kept behind a truncated manifest" "$root/extensions/pub.ext-1.2.3" kept
+
+# An empty manifest is a valid answer - no extensions installed - and must not
+# be reported as damage on every run.
+build
+printf '[]' >"$root/extensions/extensions.json"
+touch -t 202001010000 "$root/extensions/extensions.json"
+out=$(IDE_CLEAN_TMP=0 "$prune" -r "$root" 2>&1)
+case "$out" in
+    *"no usable extensions.json"*) printf '  FAIL  complained about an empty manifest\n'; failures=$(( failures + 1 )) ;;
+    *) printf '  ok    empty manifest accepted quietly\n' ;;
+esac
+
+# A stub launchctl/systemctl keeps this inside the throwaway HOME: the check is
+# what --install writes, not whether the real service manager accepts it.
+printf '\n--install carries the settings it was given into the timer:\n'
+mkdir -p "$work/bin" "$work/home"
+for stub in launchctl systemctl loginctl; do
+    printf '#!/bin/sh\nexit 0\n' >"$work/bin/$stub"
+    chmod 755 "$work/bin/$stub"
+done
+env PATH="$work/bin:$PATH" HOME="$work/home" XDG_CONFIG_HOME="$work/home/.config" \
+    IDE_KEEP_SERVERS=5 "$prune" -q --protect-live --install >/dev/null 2>&1
+unit=$(cat "$work/home/Library/LaunchAgents/local.ide-server-prune.plist" \
+           "$work/home/.config/systemd/user/ide-server-prune.service" 2>/dev/null || true)
+case "$unit" in
+    *IDE_PROTECT_LIVE*1*) printf '  ok    --protect-live written into the unit\n' ;;
+    *) printf '  FAIL  --protect-live not carried over\n'; failures=$(( failures + 1 )) ;;
+esac
+case "$unit" in
+    *IDE_KEEP_SERVERS*5*) printf '  ok    IDE_KEEP_SERVERS written into the unit\n' ;;
+    *) printf '  FAIL  IDE_KEEP_SERVERS not carried over\n'; failures=$(( failures + 1 )) ;;
+esac
+check "installed binary" "$work/home/.local/bin/ide-server-prune" kept
+
+# --dry-run promises the run changes nothing; installing writes a binary, a unit
+# and a registration with the service manager.
+printf '\n--dry-run refuses to install:\n'
+mkdir -p "$work/home-n"
+out=$(env PATH="$work/bin:$PATH" HOME="$work/home-n" XDG_CONFIG_HOME="$work/home-n/.config" \
+          "$prune" --dry-run --install 2>&1 || true)
+case "$out" in
+    *"cannot be combined"*) printf '  ok    refused\n' ;;
+    *) printf '  FAIL  installed during a dry run\n'; failures=$(( failures + 1 )) ;;
+esac
+check "no binary installed" "$work/home-n/.local/bin/ide-server-prune" gone
+
+# -r names the roots outright; IDE_SERVER_ROOTS only adds to the ones found by
+# auto-detection. Writing the first into the second is how a timer ends up
+# sweeping trees the run tried by hand never looked at.
+printf '\n--install carries -r as an argument, not as an extra root:\n'
+mkdir -p "$work/home-r"
+env PATH="$work/bin:$PATH" HOME="$work/home-r" XDG_CONFIG_HOME="$work/home-r/.config" \
+    "$prune" -q -r "$root" --install >/dev/null 2>&1
+unit=$(cat "$work/home-r/Library/LaunchAgents/local.ide-server-prune.plist" \
+           "$work/home-r/.config/systemd/user/ide-server-prune.service" 2>/dev/null || true)
+case "$unit" in
+    *IDE_SERVER_ROOTS*)
+        printf '  FAIL  written as IDE_SERVER_ROOTS, which only adds to auto-detection\n'
+        failures=$(( failures + 1 )) ;;
+    *--root*) printf '  ok    written as --root\n' ;;
+    *) printf '  FAIL  -r not carried over at all\n'; failures=$(( failures + 1 )) ;;
+esac
+case "$unit" in
+    *"$real_root"*) printf '  ok    with the resolved path\n' ;;
+    *) printf '  FAIL  the root itself is missing from the unit\n'; failures=$(( failures + 1 )) ;;
+esac
+
+# cp writes *through* a symlink, so a link left on the installed name would send
+# the copy to whatever it points at instead of being replaced by it.
+printf '\n--install does not write through a symlink left on its name:\n'
+mkdir -p "$work/home-l/.local/bin"
+printf 'precious\n' >"$work/home-l/precious"
+ln -s "$work/home-l/precious" "$work/home-l/.local/bin/ide-server-prune"
+env PATH="$work/bin:$PATH" HOME="$work/home-l" XDG_CONFIG_HOME="$work/home-l/.config" \
+    "$prune" -q --install >/dev/null 2>&1
+if [ "$(cat "$work/home-l/precious")" = precious ]; then
+    printf '  ok    the link target is untouched\n'
+else
+    printf '  FAIL  the copy went through the symlink\n'; failures=$(( failures + 1 ))
+fi
+if head -n1 "$work/home-l/.local/bin/ide-server-prune" | grep -q bash; then
+    printf '  ok    and the name now holds the script\n'
+else
+    printf '  FAIL  the script was not installed\n'; failures=$(( failures + 1 ))
+fi
+
+# The cron line is pasted into a crontab by hand, so it has to survive a shell:
+# a quote in a value or a space in a root would otherwise re-split it. Stubs that
+# fail take both platforms down the same path - the one that prints the hint.
+printf '\nthe cron hint survives a shell:\n'
+mkdir -p "$work/failbin" "$work/home-c"
+for stub in launchctl systemctl; do
+    printf '#!/bin/sh\nexit 1\n' >"$work/failbin/$stub"
+    chmod 755 "$work/failbin/$stub"
+done
+hint=$(env PATH="$work/failbin:$PATH" HOME="$work/home-c" XDG_CONFIG_HOME="$work/home-c/.config" \
+           IDE_TMP_PATTERNS="vscode-* its'-*" "$prune" -r "$root" --install 2>&1 |
+       sed -n 's/.*instead: 30 4 \* \* \* //p')
+if [ -z "$hint" ]; then
+    printf '  FAIL  no cron hint printed\n'; failures=$(( failures + 1 ))
+else
+    eval "set -- $hint"
+    got_root='' got_pattern=''
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --root) [ "$#" -gt 1 ] && got_root=$2 ;;
+            IDE_TMP_PATTERNS=*) got_pattern=${1#IDE_TMP_PATTERNS=} ;;
+        esac
+        shift
+    done
+    if [ "$got_root" = "$real_root" ]; then
+        printf '  ok    the root arrives as one argument\n'
+    else
+        printf '  FAIL  --root came back as "%s"\n' "$got_root"; failures=$(( failures + 1 ))
+    fi
+    if [ "$got_pattern" = "vscode-* its'-*" ]; then
+        printf '  ok    a value with a quote in it arrives intact\n'
+    else
+        printf '  FAIL  IDE_TMP_PATTERNS came back as "%s"\n' "$got_pattern"
+        failures=$(( failures + 1 ))
+    fi
+fi
+
+printf '\n'
+if [ "$failures" -eq 0 ]; then
+    printf 'all checks passed\n'
+else
+    printf '%d check(s) failed\n' "$failures"
+fi
+exit $(( failures > 0 ))

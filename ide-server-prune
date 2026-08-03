@@ -1,0 +1,1496 @@
+#!/usr/bin/env bash
+# ide-server-prune - keep remote VS Code / Cursor / Windsurf server trees from growing forever.
+#
+# Keeps the server versions the client actually wants - the head of the CLI's own
+# LRU list plus whatever is hosting this very shell - and removes everything else,
+# including processes left behind by old versions. Safe to run while connected.
+#
+# Portable: bash 3.2 (stock macOS) and up, Linux and Darwin, no flock/lsof/jq needed.
+set -euo pipefail
+shopt -s nullglob
+unset CDPATH
+
+PROGRAM_NAME=${0##*/}
+VERSION=2.6
+COMMIT_RE='[0-9a-f]{40}'
+ENTRY_RE='[A-Za-z][A-Za-z0-9]*-[0-9a-f]{40}(\.staging)?'
+# Every tunable, in the order the help text lists them. --install writes the
+# ones that are set into the timer it generates.
+TUNABLE_VARS='IDE_KEEP_SERVERS IDE_LOG_RETENTION_DAYS IDE_TMP_MIN_AGE_DAYS
+IDE_WORKSPACE_MIN_AGE_DAYS IDE_FRESH_GUARD_MINUTES IDE_STAGING_MIN_AGE_HOURS
+IDE_KILL_GRACE_SECONDS IDE_PROTECT_LIVE IDE_CLEAN_TMP IDE_CLEAN_EXTENSIONS
+IDE_CLEAN_WORKSPACE_STORAGE IDE_TMP_PATTERNS IDE_SERVER_ROOTS'
+readonly PROGRAM_NAME VERSION COMMIT_RE ENTRY_RE TUNABLE_VARS
+
+KEEP_SERVERS=${IDE_KEEP_SERVERS:-2}
+LOG_RETENTION_DAYS=${IDE_LOG_RETENTION_DAYS:-7}
+TMP_MIN_AGE_DAYS=${IDE_TMP_MIN_AGE_DAYS:-1}
+WORKSPACE_MIN_AGE_DAYS=${IDE_WORKSPACE_MIN_AGE_DAYS:-30}
+FRESH_GUARD_MINUTES=${IDE_FRESH_GUARD_MINUTES:-60}
+STAGING_MIN_AGE_HOURS=${IDE_STAGING_MIN_AGE_HOURS:-12}
+KILL_GRACE_SECONDS=${IDE_KILL_GRACE_SECONDS:-10}
+PROTECT_LIVE=${IDE_PROTECT_LIVE:-auto}
+CLEAN_TMP=${IDE_CLEAN_TMP:-1}
+CLEAN_EXTENSIONS=${IDE_CLEAN_EXTENSIONS:-1}
+CLEAN_WORKSPACE_STORAGE=${IDE_CLEAN_WORKSPACE_STORAGE:-1}
+# Deliberately narrow. These names belong to an IDE and to nothing else; bare
+# code-* or mcp-* would also match a human's own scratch directory in a shared
+# /tmp. Widen it yourself if your setup needs it - the names are checked, but
+# what they end up matching is then your call.
+TMP_PATTERNS="${IDE_TMP_PATTERNS:-vscode-* cursor-* windsurf-* vscodium-* node-compile-cache*}"
+
+tmp_patterns=()
+action=run
+protect_live_auto=0
+dry_run=0
+quiet=0
+freed_kb=0
+had_error=0
+explicit_roots=''
+root_path=''
+lock_dir=''
+lock_held=0
+safe_prefixes=''
+keep_set=''
+protected_pids=''
+ps_table=''
+open_paths=''
+open_paths_loaded=0
+proc_fs=0
+
+usage() {
+    cat <<EOF
+$PROGRAM_NAME $VERSION - prune stale remote IDE server installs, caches and leftover processes.
+
+Usage: $PROGRAM_NAME [options]
+
+  -n, --dry-run       report what would be removed, change nothing
+  -q, --quiet         only report the summary line
+  -k, --keep N        keep N server versions from the LRU head (default $KEEP_SERVERS;
+                      0 removes every version that is not hosting a session)
+  -r, --root PATH     operate on PATH instead of auto-detected roots (repeatable)
+  -p, --protect-live  never touch a server that is currently running
+      --no-protect-live   prune stale servers even while they are running
+      --install       install a daily timer (systemd --user on Linux, launchd on macOS)
+      --uninstall     remove that timer
+  -V, --version       print version
+  -h, --help          this text
+
+Roots are auto-detected as ~/.*-server* trees that look like an IDE server
+(VS Code, Insiders, Cursor, Windsurf, VSCodium, ...), plus ~/.codeium/windsurf-server
+and \$IDE_SERVER_ROOTS (colon-separated).
+
+--install writes whichever tunables below are set in the environment into the
+timer, so the scheduled run behaves like the one you just tried by hand.
+
+Tunables (environment):
+  IDE_KEEP_SERVERS=$KEEP_SERVERS               server versions kept from the LRU head (0 = keep none)
+  IDE_LOG_RETENTION_DAYS=$LOG_RETENTION_DAYS         logs older than this are dropped
+  IDE_TMP_MIN_AGE_DAYS=$TMP_MIN_AGE_DAYS           minimum age for temp artefacts
+  IDE_WORKSPACE_MIN_AGE_DAYS=$WORKSPACE_MIN_AGE_DAYS    minimum age for orphaned workspace storage
+  IDE_FRESH_GUARD_MINUTES=$FRESH_GUARD_MINUTES       never touch installs younger than this
+  IDE_STAGING_MIN_AGE_HOURS=$STAGING_MIN_AGE_HOURS     keep an unfinished download this long
+  IDE_KILL_GRACE_SECONDS=$KILL_GRACE_SECONDS        seconds between TERM and KILL
+  IDE_PROTECT_LIVE=$PROTECT_LIVE            1 = never kill a live server, 0 = prune stale
+                                   ones anyway, auto = 1 with no terminal attached
+  IDE_CLEAN_TMP=$CLEAN_TMP                  clean own temp artefacts
+  IDE_CLEAN_EXTENSIONS=$CLEAN_EXTENSIONS           drop superseded extension versions
+  IDE_CLEAN_WORKSPACE_STORAGE=$CLEAN_WORKSPACE_STORAGE    storage of workspaces whose folder is gone
+  IDE_TMP_PATTERNS                 temp names to sweep, space separated:
+                                   $TMP_PATTERNS
+
+Counters take whole numbers, switches take 0 or 1; anything else is refused
+rather than silently ignored.
+EOF
+}
+
+say() { [ "$quiet" -eq 1 ] || printf '%s\n' "$*"; }
+warn() { printf '%s: %s\n' "$PROGRAM_NAME" "$*" >&2; }
+die() { warn "$*"; exit 1; }
+
+# --- settings ------------------------------------------------------------------
+
+# Split the pattern list into words with pathname expansion switched off. This
+# script runs with nullglob, under which a bare "for p in $TMP_PATTERNS" would
+# glob each word against the current directory and drop every pattern that does
+# not happen to match something there - silently disabling the temp sweep.
+split_tmp_patterns() {
+    set -f
+    tmp_patterns=( $TMP_PATTERNS )
+    set +f
+}
+
+# A tunable that fails a numeric test does not fail loudly: [ abc -eq 1 ] is
+# simply false, and find -mmin -abc matches nothing, so a typo would quietly
+# turn a guard off and leave every install looking stale and unprotected.
+# Everything is therefore checked once, up front, by name.
+validate_tunables() {
+    local name pattern
+    # --install writes these into a unit file one per line, so a value carrying a
+    # newline would be split there into a second, bogus entry - and the part
+    # after the break would silently disappear from the setting it belongs to.
+    for name in $TUNABLE_VARS; do
+        case ${!name:-} in
+            *$'\n'*) die "$name must not contain a newline" ;;
+        esac
+    done
+
+    for name in KEEP_SERVERS LOG_RETENTION_DAYS TMP_MIN_AGE_DAYS \
+                WORKSPACE_MIN_AGE_DAYS FRESH_GUARD_MINUTES STAGING_MIN_AGE_HOURS \
+                KILL_GRACE_SECONDS; do
+        case ${!name} in
+            ''|*[!0-9]*)
+                [ "$name" = KEEP_SERVERS ] &&
+                    die "--keep / IDE_KEEP_SERVERS must be a whole number (got: '${!name}')"
+                die "IDE_$name must be a whole number (got: '${!name}')" ;;
+        esac
+    done
+
+    for name in CLEAN_TMP CLEAN_EXTENSIONS CLEAN_WORKSPACE_STORAGE; do
+        case ${!name} in
+            0|1) ;;
+            *) die "IDE_$name must be 0 or 1 (got: '${!name}')" ;;
+        esac
+    done
+
+    case $PROTECT_LIVE in
+        0|1|auto) ;;
+        *) die "IDE_PROTECT_LIVE must be 0, 1 or auto (got: '$PROTECT_LIVE')" ;;
+    esac
+
+    split_tmp_patterns
+    [ "${#tmp_patterns[@]}" -gt 0 ] || return 0
+    # A pattern that does not begin with a literal name would sweep far too much
+    # of a shared temp directory; one carrying a path would leave it entirely.
+    for pattern in "${tmp_patterns[@]}"; do
+        case $pattern in
+            [A-Za-z0-9]*) ;;
+            *) die "IDE_TMP_PATTERNS: '$pattern' must start with a literal name" ;;
+        esac
+        case $pattern in
+            */*) die "IDE_TMP_PATTERNS: '$pattern' must be a single name, not a path" ;;
+        esac
+    done
+}
+
+# A timer is not a descendant of the server it prunes, so the "never touch the
+# process tree hosting this shell" rule cannot see the connection a colleague is
+# working in. With no terminal on either end nobody is watching, so leave every
+# running server alone; a human at a prompt gets the full sweep.
+resolve_protect_live() {
+    [ "$PROTECT_LIVE" = auto ] || return 0
+    protect_live_auto=1
+    if [ -t 0 ] || [ -t 1 ]; then PROTECT_LIVE=0; else PROTECT_LIVE=1; fi
+}
+
+# name<tab>value for every tunable this invocation actually carries.
+set_tunables() {
+    local name
+    for name in $TUNABLE_VARS; do
+        [ -n "${!name:-}" ] && printf '%s\t%s\n' "$name" "${!name}"
+    done
+    return 0
+}
+
+human() {
+    local kb=$1
+    if [ "$kb" -ge 1048576 ]; then printf '%d.%d GB' $(( kb / 1048576 )) $(( kb % 1048576 * 10 / 1048576 ))
+    elif [ "$kb" -ge 1024 ]; then printf '%d MB' $(( kb / 1024 ))
+    else printf '%d KB' "$kb"
+    fi
+}
+
+# The first line, not the last: du -s prints one line per argument, but a name
+# carrying a newline breaks that line in two and the tail of it is the tail of
+# the *name*. Reading the last line then measures every such path as 0 KB.
+size_kb() {
+    local kb
+    kb=$( { du -sk "$1" 2>/dev/null || true; } | awk 'NR == 1 { print $1 }')
+    case "${kb:-}" in
+        ''|*[!0-9]*) printf '0' ;;
+        *) printf '%s' "$kb" ;;
+    esac
+}
+
+# GNU first, and every answer checked for being a number rather than only the
+# last one. GNU stat reads -f as --file-system, where %m is not a directive it
+# knows: it prints "?" and still exits 0, so asking it the BSD way first would
+# shadow the spelling it does understand and leave every mtime reading as 0.
+mtime_of() {
+    local s
+    s=$(stat -c '%Y' "$1" 2>/dev/null || true)
+    case "${s:-}" in
+        ''|*[!0-9]*) s=$(stat -f '%m' "$1" 2>/dev/null || true) ;;
+    esac
+    case "${s:-}" in
+        ''|*[!0-9]*) printf '0' ;;
+        *) printf '%s' "$s" ;;
+    esac
+}
+
+# Absolute, symlink-resolved path of an existing directory.
+abs_dir() { ( cd -- "$1" >/dev/null 2>&1 && pwd -P ) 2>/dev/null || printf '%s' "$1"; }
+
+abs_file() {
+    local d b
+    d=$(dirname -- "$1"); b=$(basename -- "$1")
+    printf '%s/%s' "$(abs_dir "$d")" "$b"
+}
+
+# Sets are "|a|b|c|" strings - bash 3.2 has no associative arrays.
+keep_has() { case "$keep_set" in *"|$1|"*) return 0 ;; esac; return 1; }
+keep_add() { keep_has "$1" || keep_set="${keep_set:-|}$1|"; }
+
+# --- removal -------------------------------------------------------------------
+
+under_safe_prefix() {
+    local target=$1 prefix rest
+    rest=$safe_prefixes
+    while [ -n "$rest" ]; do
+        prefix=${rest%%$'\n'*}
+        if [ "$rest" = "$prefix" ]; then rest=''; else rest=${rest#*$'\n'}; fi
+        [ -n "$prefix" ] || continue
+        case "$target" in "$prefix"/*) return 0 ;; esac
+    done
+    return 1
+}
+
+# Nothing is removed unless it lives under a root we resolved ourselves. Checked
+# three ways: the literal path, the path with every symlinked parent resolved (so
+# a planted symlink inside the tree cannot redirect a removal out of it), and a
+# flat refusal of any "." or ".." component (so a name read out of a file on disk
+# cannot walk up out of the directory the caller meant).
+is_safe_target() {
+    local target=$1 parent real_parent
+    # Defence in depth behind under_safe_prefix, not the containment itself, so
+    # it is set to the shortest path a legitimate prefix can carry: the shortest
+    # temp directory prune_tmp accepts is four characters, plus a separator and
+    # a name of at least one. A server root is longer still. Set any higher and
+    # a short but perfectly legal temp name - /tmp/code- under a widened
+    # IDE_TMP_PATTERNS - is refused with a message about roots that has nothing
+    # to do with it, and the run reports an error it did not have.
+    [ ${#target} -ge 6 ] || return 1
+    [ "$target" = "$HOME" ] && return 1
+    [ "$target" = "$HOME_REAL" ] && return 1
+    case "$target" in
+        */*) ;;
+        *) return 1 ;;
+    esac
+    case "$target" in
+        ./*|../*|*/./*|*/../*|*/.|*/..|*//*) return 1 ;;
+    esac
+    under_safe_prefix "$target" || return 1
+    parent=${target%/*}
+    [ -n "$parent" ] || return 1
+    # Resolved here rather than through abs_dir(), which answers with its own
+    # argument when it cannot resolve one. That fallback is right for reporting
+    # and wrong for a guard: an unresolvable parent would be compared literally
+    # and so pass the very check it was meant to fail. A parent we cannot enter
+    # is a parent we could not have removed through either, so refusing costs
+    # nothing.
+    real_parent=$( cd -- "$parent" >/dev/null 2>&1 && pwd -P ) || return 1
+    [ -n "$real_parent" ] || return 1
+    under_safe_prefix "$real_parent/${target##*/}"
+}
+
+# A single plain path component: what a directory name read out of a JSON file on
+# disk is allowed to be before we build a path from it.
+is_plain_name() {
+    case ${1:-} in
+        ''|.|..|*/*|.*) return 1 ;;
+    esac
+    return 0
+}
+
+# The containment gate, asked before anything irreversible rather than only
+# before the removal itself. A stale install is signalled first and deleted
+# after, so a path the gate would refuse must not be signalled either: the
+# caller asks here, and discard asks again on its own behalf. Answering twice
+# for the same path is free, and warns only once - the second call sees a path
+# the first one already accepted.
+may_remove() {
+    is_safe_target "$1" && return 0
+    warn "refusing to remove outside known roots: $1"
+    had_error=1
+    return 1
+}
+
+discard() {
+    local target=$1 reason=${2:-} kb
+    [ -e "$target" ] || [ -L "$target" ] || return 0
+    may_remove "$target" || return 0
+    kb=$(size_kb "$target")
+    if [ "$dry_run" -eq 1 ]; then
+        say "  would remove ${target}${reason:+  [$reason]}  ($(human "$kb"))"
+        freed_kb=$(( freed_kb + kb ))
+    elif rm -rf -- "$target"; then
+        say "  removed ${target}${reason:+  [$reason]}  ($(human "$kb"))"
+        freed_kb=$(( freed_kb + kb ))
+    else
+        warn "could not remove $target"
+        had_error=1
+    fi
+}
+
+is_fresh() {
+    [ -n "$(find "$1" -maxdepth 0 -mmin "-$FRESH_GUARD_MINUTES" 2>/dev/null)" ]
+}
+
+# A finished install is guarded by its own mtime; a download still in flight is
+# not. The CLI writes *inside* the staging directory, which can leave the
+# directory itself looking untouched for as long as the transfer runs - and half
+# a gigabyte over a thin link takes far longer than the hour that guards a
+# finished install. So ask the whole subtree, over a much wider window.
+staging_in_progress() {
+    [ "$STAGING_MIN_AGE_HOURS" -gt 0 ] || return 1
+    [ -n "$( { find "$1" -mmin "-$(( STAGING_MIN_AGE_HOURS * 60 ))" 2>/dev/null || true; } |
+        head -n1)" ]
+}
+
+older_than_days() {
+    [ -n "$(find "$1" -maxdepth 0 -mtime "+$2" 2>/dev/null)" ]
+}
+
+# --- processes -----------------------------------------------------------------
+
+# pid <tab> ppid <tab> pgid <tab> args, own uid only. Works on Linux and Darwin.
+ps_refresh() {
+    ps_table=$( { ps -A -o pid=,ppid=,pgid=,uid=,args= 2>/dev/null || true; } |
+        awk -v u="$UID_SELF" '$4 == u {
+            pid=$1; ppid=$2; pgid=$3; $1=$2=$3=$4="";
+            sub(/^[ \t]+/, "");
+            print pid "\t" ppid "\t" pgid "\t" $0
+        }')
+}
+
+args_of_pid() { awk -F'\t' -v p="$1" '$1 == p { print $4; exit }' <<<"$ps_table"; }
+
+# This shell and every ancestor of it: killing one of those would cut the branch
+# we are sitting on (think "run from a terminal inside the very server we prune").
+collect_protected_pids() {
+    local pid=$$ hops=0 parent
+    protected_pids='|'
+    while [ "$hops" -lt 64 ]; do
+        case "$pid" in 0|1|'') break ;; esac
+        case "$protected_pids" in *"|$pid|"*) break ;; esac
+        protected_pids="$protected_pids$pid|"
+        parent=$(awk -F'\t' -v p="$pid" '$1 == p { print $2; exit }' <<<"$ps_table")
+        [ -n "$parent" ] || break
+        pid=$parent
+        hops=$(( hops + 1 ))
+    done
+}
+
+# The needle travels through the environment, not through -v: awk expands escape
+# sequences in -v assignments, which would corrupt any path containing a backslash.
+#
+# Stable-<commit> is a prefix of Stable-<commit>.staging, so a plain substring
+# test would let the removal of a finished install take the download that is
+# meant to replace it down with it - the very transfer the caller just decided to
+# protect. Every occurrence is examined, not only the first: a process may well
+# name both directories.
+pids_matching() {
+    IDE_NEEDLE=$1 awk -F'\t' -v mine="$PGID_SELF" -v prot="$protected_pids" '
+        BEGIN { needle = ENVIRON["IDE_NEEDLE"]; n = length(needle) }
+        $3 == mine { next }
+        index(prot, "|" $1 "|") { next }
+        {
+            rest = $4
+            while ((i = index(rest, needle)) > 0) {
+                rest = substr(rest, i + n)
+                if (substr(rest, 1, 8) != ".staging") { print $1; next }
+            }
+        }' <<<"$ps_table"
+}
+
+terminate_matching() {
+    local needle=$1 pids pid waited
+    ps_refresh
+    pids=$(pids_matching "$needle")
+    [ -n "$pids" ] || return 0
+
+    if [ "$dry_run" -eq 1 ]; then
+        say "  would terminate pids: $(tr '\n' ' ' <<<"$pids")"
+        return 0
+    fi
+
+    say "  terminating pids: $(tr '\n' ' ' <<<"$pids")"
+    for pid in $pids; do kill -TERM "$pid" 2>/dev/null || true; done
+
+    waited=0
+    while [ "$waited" -lt "$KILL_GRACE_SECONDS" ]; do
+        sleep 1
+        waited=$(( waited + 1 ))
+        ps_refresh
+        pids=$(pids_matching "$needle")
+        [ -n "$pids" ] || return 0
+    done
+    say "  killing survivors: $(tr '\n' ' ' <<<"$pids")"
+    for pid in $pids; do kill -KILL "$pid" 2>/dev/null || true; done
+}
+
+# Anything of ours still running out of this path. The table is rebuilt here
+# rather than trusted: every terminate_matching refreshes it, so by the time a
+# later candidate is considered the copy in hand may describe a moment before
+# an earlier candidate's processes were signalled.
+has_live_process() {
+    ps_refresh
+    [ -n "$(pids_matching "$1")" ]
+}
+
+commit_of() { grep -oE "$COMMIT_RE" <<<"$1" | head -n1 || true; }
+
+quote_re() { sed -E 's/[][(){}.*+?^$|\\\/]/\\&/g' <<<"$1"; }
+
+# --- roots ---------------------------------------------------------------------
+
+# cli/servers belongs to the CLI and to nothing else. The legacy layout has no
+# such name to offer - only bin and data - and that pair is far too ordinary a
+# shape to adopt a directory on: a stray ~/.something-server holding those two
+# would be taken for a server tree and have its data/logs swept on the next run.
+# So for the legacy layout ask for a mark the editor actually leaves: an install
+# named after a commit, or the User/Machine state directory it keeps beside one.
+looks_like_server_root() {
+    local dir
+    [ -d "$1/cli/servers" ] && return 0
+    [ -d "$1/bin" ] && [ -d "$1/data" ] || return 1
+    [ -d "$1/data/User" ] && return 0
+    [ -d "$1/data/Machine" ] && return 0
+    for dir in "$1"/bin/*/; do
+        dir=${dir%/}
+        [ -n "$(commit_of "${dir##*/}")" ] && return 0
+    done
+    return 1
+}
+
+resolve_roots() {
+    local candidates='' root resolved seen='|' item rest
+    if [ -n "$explicit_roots" ]; then
+        candidates=$explicit_roots
+    else
+        for root in "$HOME"/.*-server "$HOME"/.*-server-* "$HOME"/.codeium/windsurf-server; do
+            [ -d "$root" ] || continue
+            looks_like_server_root "$root" || continue
+            candidates="$candidates$root"$'\n'
+        done
+        rest=${IDE_SERVER_ROOTS:-}
+        while [ -n "$rest" ]; do
+            item=${rest%%:*}
+            if [ "$rest" = "$item" ]; then rest=''; else rest=${rest#*:}; fi
+            [ -n "$item" ] && candidates="$candidates$item"$'\n'
+        done
+    fi
+
+    while IFS= read -r root; do
+        [ -n "$root" ] || continue
+        if [ ! -d "$root" ]; then
+            [ -n "$explicit_roots" ] && die "no such directory: $root"
+            continue
+        fi
+        resolved=$(abs_dir "$root")
+        case "$resolved" in
+            /|"$HOME"|"$HOME"/|"$HOME_REAL"|"$HOME_REAL"/) die "refusing to operate on $resolved" ;;
+        esac
+        [ ${#resolved} -ge 8 ] || die "refusing to operate on $resolved"
+        [ -w "$resolved" ] || { warn "not writable, skipping: $resolved"; continue; }
+        # Auto-detected roots passed this already; a root named by --root or by
+        # IDE_SERVER_ROOTS has not, and a typo there would point the whole run at
+        # an unrelated tree. Refuse rather than prune something we do not know.
+        looks_like_server_root "$resolved" ||
+            die "$resolved does not look like an IDE server root (no cli/servers, no bin+data)"
+        case "$seen" in *"|$resolved|"*) continue ;; esac
+        seen="$seen$resolved|"
+        printf '%s\n' "$resolved"
+    done <<<"$candidates"
+}
+
+# --- keep set ------------------------------------------------------------------
+
+# Is there still a directory on disk for this commit, in either layout?
+install_exists() {
+    local root=$1 commit=$2 dir
+    for dir in "$root"/cli/servers/*-"$commit" "$root"/cli/servers/"$commit" \
+               "$root"/bin/"$commit"; do
+        [ -d "$dir" ] && return 0
+    done
+    return 1
+}
+
+collect_keep_commits() {
+    local root=$1 lru="$root/cli/servers/lru.json" commit pid args newest kept=0
+    keep_set=''
+
+    if [ -r "$lru" ] && [ "$KEEP_SERVERS" -gt 0 ]; then
+        while IFS= read -r commit; do
+            [ -n "$commit" ] || continue
+            [ "$kept" -lt "$KEEP_SERVERS" ] || break
+            # An entry whose directory is already gone must not occupy a keep
+            # slot. It would leave the set non-empty, so the "keep the newest
+            # install" fallback never fires - and every install actually on disk
+            # would then look stale.
+            install_exists "$root" "$commit" || continue
+            keep_has "$commit" || kept=$(( kept + 1 ))
+            keep_add "$commit"
+        done < <(grep -oE "$COMMIT_RE" "$lru" 2>/dev/null || true)
+    fi
+
+    # Never prune the server that is hosting this very shell.
+    for pid in $(tr '|' ' ' <<<"$protected_pids"); do
+        args=$(args_of_pid "$pid")
+        case "$args" in *"$root"/*) ;; *) continue ;; esac
+        while IFS= read -r commit; do
+            [ -n "$commit" ] || continue
+            keep_has "$commit" || say "  keeping ${commit:0:8} - it hosts this session"
+            keep_add "$commit"
+        done < <(grep -oE "$COMMIT_RE" <<<"$args" | sort -u || true)
+    done
+
+    if [ "$PROTECT_LIVE" -eq 1 ]; then
+        for pid in $(pids_matching "$root/"); do
+            args=$(args_of_pid "$pid")
+            while IFS= read -r commit; do
+                [ -n "$commit" ] && keep_add "$commit"
+            done < <(grep -oE "$COMMIT_RE" <<<"$args" | sort -u || true)
+        done
+    fi
+
+    # No LRU and nothing live: fall back to the most recently installed tree.
+    if [ -z "$keep_set" ] && [ "$KEEP_SERVERS" -gt 0 ]; then
+        newest=$(newest_install "$root")
+        commit=$(commit_of "$newest")
+        if [ -n "$commit" ]; then keep_add "$commit"; fi
+    fi
+    return 0
+}
+
+# The last line of defence, so it answers with *something* whenever there is a
+# candidate at all: starting the comparison below zero means an unreadable mtime
+# picks the first install rather than none, and "none" here would leave the keep
+# set empty and mark every version in the root stale. Unfinished downloads are no
+# answer - keeping one of those would protect nothing anybody can connect to.
+newest_install() {
+    local root=$1 dir base stamp best='' best_stamp=-1
+    for dir in "$root"/cli/servers/*/ "$root"/bin/*/; do
+        dir=${dir%/}
+        [ -d "$dir" ] || continue
+        base=${dir##*/}
+        case "$base" in *.staging) continue ;; esac
+        [ -n "$(commit_of "$base")" ] || continue
+        stamp=$(mtime_of "$dir")
+        if [ "$stamp" -gt "$best_stamp" ]; then best_stamp=$stamp; best=$base; fi
+    done
+    printf '%s' "$best"
+}
+
+# --- server trees --------------------------------------------------------------
+
+prune_servers() {
+    local root=$1 path commit base
+
+    collect_keep_commits "$root"
+    say "  keeping: $(printf '%s' "${keep_set:-none}" | tr '|' ' ' | sed -E 's/^ +| +$//g')"
+
+    for path in "$root"/cli/servers/*/ "$root"/bin/*/; do
+        path=${path%/}
+        [ -d "$path" ] || continue
+        base=${path##*/}
+        commit=$(commit_of "$base")
+        [ -n "$commit" ] || continue
+        # A .staging directory is a download that never completed; the finished
+        # install lives next to it under the plain name. It is never in the keep
+        # set - no commit is recorded for a version nobody could start yet - so
+        # its own guard is all that stands between a transfer in flight and its
+        # removal.
+        case "$base" in
+            *.staging)
+                if staging_in_progress "$path"; then
+                    say "  skipping unfinished download $path"
+                    continue
+                fi
+                # PROTECT_LIVE spares a running server by keeping its commit,
+                # and no commit is ever recorded for a download nobody could
+                # start yet - so the promise has nothing to hold a staging
+                # directory by. Ask about the path instead: a transfer that has
+                # written nothing for half a day still belongs to a process
+                # somebody is running, and an unattended sweep is exactly the
+                # case where nobody is watching to notice it die.
+                if [ "$PROTECT_LIVE" -eq 1 ] && has_live_process "$path"; then
+                    say "  skipping live download $path"
+                    continue
+                fi ;;
+            *)
+                if keep_has "$commit"; then continue; fi
+                if is_fresh "$path"; then say "  skipping fresh install $path"; continue; fi ;;
+        esac
+        may_remove "$path" || continue
+        terminate_matching "$path"
+        discard "$path" "stale ${commit:0:8}"
+    done
+
+    # Everything else at the top level that carries a commit in its name:
+    # code-<commit>, .cli.<commit>.log, legacy .<commit>.log/.pid/.token.
+    for path in "$root"/* "$root"/.[!.]*; do
+        [ -e "$path" ] || continue
+        base=${path##*/}
+        case "$base" in bin|cli|data|extensions) continue ;; esac
+        commit=$(commit_of "$base")
+        [ -n "$commit" ] || continue
+        keep_has "$commit" && continue
+        is_fresh "$path" && continue
+        may_remove "$path" || continue
+        [ -d "$path" ] && terminate_matching "$path"
+        discard "$path" "stale ${commit:0:8}"
+    done
+
+    prune_stale_logs "$root"
+    prune_lru "$root"
+    sweep_orphan_processes "$root"
+}
+
+# Logs with no commit in the name (cli/agent-host-*.log): age-based only, and
+# never one that some process is still writing to.
+prune_stale_logs() {
+    local root=$1 path
+    [ -d "$root/cli" ] || return 0
+    while IFS= read -r -d '' path; do
+        [ -n "$path" ] || continue
+        path_in_use "$path" && continue
+        discard "$path" "log > ${LOG_RETENTION_DAYS}d"
+    done < <(find "$root/cli" -maxdepth 1 -type f -name '*.log' -mtime "+$LOG_RETENTION_DAYS" -print0 2>/dev/null || true)
+}
+
+# lru.json is a flat JSON array of cache entry names, most recently used first
+# (microsoft/vscode, cli/src/download_cache.rs). Drop entries whose directory we
+# removed, keep the order, and refuse to touch anything that is not that format.
+prune_lru() {
+    local root=$1 lru="$root/cli/servers/lru.json" entry list='' quoted found original updated
+    [ -f "$lru" ] && [ -r "$lru" ] && [ -w "$lru" ] || return 0
+
+    # Readable was asked for above, and the read is still guarded: this is a
+    # plain assignment, so under set -e a failure here would end the whole run on
+    # the spot - no summary, and every later pass skipped, exactly the way the
+    # unguarded grep below used to. An empty answer fails the shape test that
+    # follows, which is the same "leave it alone" this function already has.
+    original=$( { tr -d ' \t\r\n' <"$lru"; } 2>/dev/null || true)
+    case "$original" in
+        '['*']') ;;
+        *) warn "unexpected lru.json layout, left untouched: $lru"; return 0 ;;
+    esac
+
+    # An empty array is a perfectly good lru.json - it is what this very function
+    # writes once the last install is gone - and grep reports "no match" with a
+    # non-zero status. Under pipefail that status becomes the assignment's, and
+    # under set -e it would end the whole run right here: no message, no summary,
+    # every later pass skipped, on a file we wrote ourselves the run before.
+    quoted=$( { grep -oE '"[^"]*"' "$lru" 2>/dev/null || true; } | wc -l | tr -d ' ')
+    found=$( { grep -oE "\"$ENTRY_RE\"" "$lru" 2>/dev/null || true; } | wc -l | tr -d ' ')
+    if [ "$quoted" != "$found" ]; then
+        warn "unrecognised lru.json entries, left untouched: $lru"
+        return 0
+    fi
+
+    while IFS= read -r entry; do
+        [ -n "$entry" ] || continue
+        [ -d "$root/cli/servers/$entry" ] || continue
+        list="$list,\"$entry\""
+    done < <(grep -oE "$ENTRY_RE" "$lru" || true)
+
+    updated="[${list#,}]"
+    [ "$updated" = "$original" ] && return 0
+    say "  rewriting lru.json - dropping entries whose install is gone"
+    [ "$dry_run" -eq 1 ] && return 0
+    if printf '%s\n' "$updated" >"$lru.tmp.$$" 2>/dev/null; then
+        mv -f "$lru.tmp.$$" "$lru" || { rm -f "$lru.tmp.$$"; warn "could not update $lru"; }
+    else
+        warn "could not write $lru"
+    fi
+}
+
+# Processes whose server tree a previous run already deleted.
+#
+# Collected first and signalled after, so the grace period is served once for
+# the whole set rather than once per process - and so it can be the configured
+# one. Signalling inside the loop meant a hard one second, which both ignored
+# IDE_KILL_GRACE_SECONDS and multiplied by the number of orphans.
+sweep_orphan_processes() {
+    local root=$1 pid args path live missing orphans='' alive waited
+    [ "$PROTECT_LIVE" -eq 1 ] && return 0
+    ps_refresh
+    for pid in $(pids_matching "$root/"); do
+        args=$(args_of_pid "$pid")
+        # Both layouts: cli/servers/Stable-<commit> carries a name, the legacy
+        # bin/<commit> is the bare commit - and a regex asking only for the
+        # former never sweeps a legacy orphan at all.
+        #
+        # Every install the arguments name, not only the first. A server process
+        # names more than one path, and reading just the first meant a process
+        # whose argv happens to mention a tree an earlier run removed *before*
+        # the tree it is actually running out of was declared an orphan and
+        # killed - a live session taken down by the sweep meant to clean up after
+        # dead ones. One surviving reference is enough to spare it.
+        live=0
+        missing=''
+        while IFS= read -r path; do
+            [ -n "$path" ] || continue
+            if [ -d "$path" ]; then live=1; break; fi
+            [ -n "$missing" ] || missing=$path
+        done < <(grep -oE "$(quote_re "$root")/(cli/servers|bin)/($ENTRY_RE|$COMMIT_RE)" <<<"$args" ||
+            true)
+        [ "$live" -eq 0 ] || continue
+        [ -n "$missing" ] || continue
+        say "  orphan process $pid still references removed $missing"
+        orphans="$orphans $pid"
+    done
+    [ -n "$orphans" ] || return 0
+    [ "$dry_run" -eq 1 ] && return 0
+
+    for pid in $orphans; do kill -TERM "$pid" 2>/dev/null || true; done
+    alive=$orphans
+    waited=0
+    while [ "$waited" -lt "$KILL_GRACE_SECONDS" ]; do
+        sleep 1
+        waited=$(( waited + 1 ))
+        alive=''
+        for pid in $orphans; do
+            kill -0 "$pid" 2>/dev/null && alive="$alive $pid"
+        done
+        [ -n "$alive" ] || return 0
+    done
+    say "  killing survivors:$alive"
+    for pid in $alive; do kill -KILL "$pid" 2>/dev/null || true; done
+    return 0
+}
+
+# --- data directory ------------------------------------------------------------
+
+prune_data_caches() {
+    local root=$1 data="$root/data" path commit
+    [ -d "$data" ] || return 0
+
+    for path in "$data/CachedExtensionVSIXs" "$data/CachedProfilesData" "$data/clp"; do
+        discard "$path" "cache"
+    done
+
+    # The V8 code cache is written per server commit; keep the ones we keep.
+    for path in "$data"/CachedData/*/; do
+        path=${path%/}
+        [ -d "$path" ] || continue
+        commit=$(commit_of "${path##*/}")
+        [ -n "$commit" ] && keep_has "$commit" && continue
+        discard "$path" "code cache"
+    done
+
+    # Asked the same question the CLI logs are asked. A session directory older
+    # than the retention window still belongs to a session that has simply been
+    # up longer than that, and the retention window is short enough for the two
+    # to overlap.
+    [ -d "$data/logs" ] || return 0
+    while IFS= read -r -d '' path; do
+        [ -n "$path" ] || continue
+        path_in_use "$path" && continue
+        discard "$path" "log > ${LOG_RETENTION_DAYS}d"
+    done < <(find "$data/logs" -mindepth 1 -maxdepth 1 -mtime "+$LOG_RETENTION_DAYS" -print0 2>/dev/null || true)
+}
+
+# --- extensions ----------------------------------------------------------------
+
+prune_extensions() {
+    [ "$CLEAN_EXTENSIONS" -eq 1 ] || return 0
+    local root=$1 dir="$root/extensions" manifest obsolete path entry manifest_body
+    local prev_name='' prev_dir='' name version
+    [ -d "$dir" ] || return 0
+    manifest="$dir/extensions.json"
+    obsolete="$dir/.obsolete"
+
+    for path in "$dir"/*.vsctmp; do
+        [ -e "$path" ] || continue
+        is_fresh "$path" && continue
+        discard "$path" "interrupted install"
+    done
+
+    # The IDE records extensions it failed to delete in .obsolete; those are free wins.
+    if [ -f "$obsolete" ]; then
+        while IFS= read -r entry; do
+            if ! is_plain_name "$entry"; then
+                [ -n "$entry" ] && warn "ignoring suspicious .obsolete entry: $entry"
+                continue
+            fi
+            [ -d "$dir/$entry" ] || continue
+            is_fresh "$dir/$entry" && continue
+            discard "$dir/$entry" "marked obsolete by the IDE"
+        done < <(grep -oE '"[^"]+"[[:space:]]*:[[:space:]]*true' "$obsolete" 2>/dev/null |
+            sed -E 's/^"([^"]+)".*/\1/' || true)
+    fi
+
+    # extensions.json lists the version of each extension the IDE currently uses.
+    # We only remove directories it does not reference, so the manifest can never
+    # end up pointing at something we deleted - and with no readable manifest we
+    # remove nothing at all: "looks like an older version number" is a guess, and
+    # guessing wrong uninstalls an extension that was in use.
+    # A JSON array, like lru.json. "[]" is a perfectly good answer - it means
+    # nothing is installed - so the test is the shape, not the contents.
+    manifest_body=$( { tr -d ' \t\r\n' <"$manifest"; } 2>/dev/null || true)
+    case "$manifest_body" in
+        '['*']') ;;
+        *) warn "no usable extensions.json under $dir; leaving extension versions alone"
+           return 0 ;;
+    esac
+
+    # Ordering versions is the whole basis for calling one of them superseded,
+    # and a sort that reads 1.10.0 as older than 1.9.0 would nominate the newest
+    # one for removal. Where version-aware sorting is missing - it is not POSIX,
+    # and busybox has none - say so and leave the versions alone.
+    if ! version_sort_works; then
+        warn "no version-aware sort here; leaving extension versions alone"
+        return 0
+    fi
+
+    while IFS=$'\t' read -r name version path; do
+        [ -n "$name" ] || continue
+        if [ "$name" = "$prev_name" ]; then
+            if grep -qF -- "${prev_dir##*/}\"" "$manifest"; then
+                say "  keeping ${prev_dir##*/} - still referenced by extensions.json"
+            elif ! is_fresh "$prev_dir"; then
+                discard "$prev_dir" "superseded by $version"
+            fi
+        fi
+        prev_name=$name
+        prev_dir=$path
+    done < <(extension_versions "$dir" | sort -t$'\t' -k1,1 -k2,2V)
+}
+
+# The answer has to be wrong in the same way a lexical sort is, not merely
+# absent: busybox accepts -V and ignores it, which is worse than refusing it.
+version_sort_works() {
+    [ "$( { printf '1.9.0\n1.10.0\n' | sort -V 2>/dev/null || true; } | tail -n1)" = 1.10.0 ]
+}
+
+extension_versions() {
+    local dir=$1 path base version name
+    for path in "$dir"/*/; do
+        path=${path%/}
+        [ -d "$path" ] || continue
+        base=${path##*/}
+        # A tab or a newline in the name would shift the fields the caller reads
+        # back, and the path it then acted on would not be the one measured here.
+        case $base in *[$'\t\n']*) continue ;; esac
+        version=$(grep -oE -- '-[0-9]+\.[0-9]+\.[0-9]+.*$' <<<"$base" || true)
+        [ -n "$version" ] || continue
+        name=${base%"$version"}
+        printf '%s\t%s\t%s\n' "$name" "${version#-}" "$path"
+    done
+}
+
+# --- workspace storage ---------------------------------------------------------
+
+prune_workspace_storage() {
+    [ "$CLEAN_WORKSPACE_STORAGE" -eq 1 ] || return 0
+    local root=$1 storage="$root/data/User/workspaceStorage" entry target decoded parent
+    [ -d "$storage" ] || return 0
+
+    for entry in "$storage"/*/; do
+        entry=${entry%/}
+        [ -d "$entry" ] || continue
+        older_than_days "$entry" "$WORKSPACE_MIN_AGE_DAYS" || continue
+
+        if [ ! -f "$entry/workspace.json" ]; then
+            [ -n "$(find "$entry" -mindepth 1 -maxdepth 1 2>/dev/null)" ] && continue
+            discard "$entry" "empty workspace storage"
+            continue
+        fi
+
+        target=$(grep -oE '"(folder|workspace)"[[:space:]]*:[[:space:]]*"file://[^"]+"' "$entry/workspace.json" |
+            head -n1 | sed -E 's|.*"file://([^"]+)".*|\1|' || true)
+        [ -n "$target" ] || continue
+        if ! decoded=$(percent_decode "$target"); then
+            say "  keeping $entry - cannot read its workspace path"
+            continue
+        fi
+        [ -e "$decoded" ] && continue
+        # Gone, or never reachable from here? A workspace whose parent directory
+        # is missing as well reads more like a volume that is not mounted, or a
+        # home that moved, than a project somebody deleted - and this storage is
+        # the only place that project's local history lives.
+        parent=${decoded%/*}
+        [ -n "$parent" ] || continue
+        if [ ! -d "$parent" ]; then
+            say "  keeping $entry - $parent is not there either"
+            continue
+        fi
+        discard "$entry" "workspace gone: $decoded"
+    done
+}
+
+# file:// paths in workspace.json are percent-encoded, so a literal per-cent sign
+# arrives as %25 and every other % introduces a pair of hex digits. Anything else
+# is a file we do not understand, and decoding it by hand would turn "100%done"
+# into "100<CR>one" - a path that cannot exist, which is precisely the answer
+# that makes the caller delete things. Say so instead of guessing.
+percent_decode() {
+    local s=$1 rest out
+    case "$s" in
+        *%*) ;;
+        *) printf '%s' "$s"; return 0 ;;
+    esac
+    rest=$s
+    while [ -n "$rest" ]; do
+        case "$rest" in
+            %[0-9A-Fa-f][0-9A-Fa-f]*) ;;
+            %*) return 1 ;;
+        esac
+        rest=${rest#?}
+    done
+    s=${s//\\/\\\\}
+    # The marker keeps a trailing newline alive long enough to be rejected below;
+    # command substitution would otherwise strip it and hide it from the test.
+    out=$(printf '%b|' "${s//%/\\x}")
+    out=${out%|}
+    case "$out" in
+        ''|*[[:cntrl:]]*) return 1 ;;
+    esac
+    printf '%s' "$out"
+}
+
+# --- temp files ----------------------------------------------------------------
+
+# One readlink per descriptor is one fork per descriptor, and a busy host has
+# tens of thousands of them - half a minute of forking before the first question
+# is even asked. GNU find answers all of it in a single process; where -printf is
+# missing (busybox) the portable walk is still there to fall back on.
+load_open_paths() {
+    [ "$open_paths_loaded" -eq 1 ] && return 0
+    open_paths_loaded=1
+    local link target
+    # task/ repeats every descriptor once per thread and map_files/ is a second
+    # view of the same mappings; pruning both keeps this to one pass over the
+    # descriptors themselves.
+    open_paths=$( { find /proc -maxdepth 3 \( -name task -o -name map_files \) -prune \
+        -o -type l -printf '%l\n' 2>/dev/null || true; } )
+    [ -n "$open_paths" ] && return 0
+    for link in /proc/[0-9]*/fd/* /proc/[0-9]*/cwd; do
+        target=$(readlink "$link" 2>/dev/null) || continue
+        open_paths="$open_paths$target"$'\n'
+    done
+    return 0
+}
+
+# Matched in one pass by the pattern matcher rather than by walking the list in
+# shell. Consuming it line by line with ${rest#*$'\n'} copies the remainder of a
+# multi-megabyte string on every iteration, which is quadratic: measured at 23
+# seconds for four thousand descriptors, and this runs once per candidate file.
+# The quoted "$target" inside the pattern stays literal, as it did before.
+path_in_use() {
+    local target=$1 hit
+    if [ "$proc_fs" -eq 1 ]; then
+        load_open_paths
+        # Bracketed on both sides: command substitution strips the trailing
+        # newline, and without one the last entry could never match exactly.
+        case $'\n'"$open_paths"$'\n' in
+            *$'\n'"$target"$'\n'*|*$'\n'"$target"/*) return 0 ;;
+        esac
+        return 1
+    fi
+    if command -v lsof >/dev/null 2>&1; then
+        # The exit status is not an answer here. lsof reports "nothing open" and
+        # "part of the walk was refused" with the same non-zero status, and +D on
+        # a directory it did enumerate perfectly well still exits 1 - so reading
+        # the status made every directory look free, on every host without
+        # /proc. The output is the answer: -F gives one machine-readable line
+        # per hit and nothing at all when there are none.
+        if [ -d "$target" ]; then
+            hit=$( { lsof -w -F n +D "$target" 2>/dev/null || true; } | head -n1)
+        else
+            hit=$( { lsof -w -F n -- "$target" 2>/dev/null || true; } | head -n1)
+        fi
+        [ -n "$hit" ] && return 0
+        return 1
+    fi
+    return 0  # cannot tell - assume in use
+}
+
+prune_tmp() {
+    [ "$CLEAN_TMP" -eq 1 ] || return 0
+    [ "${#tmp_patterns[@]}" -gt 0 ] || return 0
+    if [ "$proc_fs" -eq 0 ] && ! command -v lsof >/dev/null 2>&1; then
+        warn "neither /proc nor lsof available; skipping temp cleanup"
+        return 0
+    fi
+
+    # Resolved, because /tmp is a symlink to /private/tmp on macOS: find does not
+    # descend into a symlinked starting point, and the prefix check below has to
+    # compare like with like.
+    local dirs='' tmp pattern path seen='|'
+    for tmp in "${TMPDIR:-/tmp}" /tmp; do
+        [ -d "$tmp" ] || continue
+        tmp=$(abs_dir "$tmp")
+        # TMPDIR and /tmp are very often the same directory. Remembered before
+        # the screen rather than after it, so a directory the screen refuses is
+        # named once instead of twice: what is refused on the first pass is
+        # refused identically on the second.
+        case "$seen" in *"|$tmp|"*) continue ;; esac
+        seen="$seen$tmp|"
+        # A temp directory becomes a removal root for the rest of the run, so it
+        # answers the same question a server root does. TMPDIR=$HOME is a real
+        # setting on locked-down hosts, and without this it would quietly widen
+        # every path check that follows.
+        case "$tmp" in
+            /|"$HOME"|"$HOME_REAL")
+                warn "ignoring unsuitable temp directory: $tmp"; continue ;;
+        esac
+        # A server root has a structure to be recognised by; a temp directory has
+        # none, so the only test left is the name. These are never one, however
+        # they got into TMPDIR - and a length test alone lets every one of them
+        # through, after which the sweep is a single -name match from a system
+        # path. Anything resolving below them is still fine: macOS hands out
+        # /private/var/folders/... and that is the normal answer here.
+        case "$tmp" in
+            /bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/usr|/var)
+                warn "ignoring unsuitable temp directory: $tmp"; continue ;;
+            /Applications|/Library|/System|/Users|/Volumes|/private|/net)
+                warn "ignoring unsuitable temp directory: $tmp"; continue ;;
+        esac
+        # Length alone is a thin test - /var and /usr clear it. What actually
+        # matters is that the directory must not contain the home it would then
+        # be free to sweep names out of.
+        case "$HOME_REAL/" in
+            "$tmp"/*) warn "ignoring temp directory that contains \$HOME: $tmp"; continue ;;
+        esac
+        [ ${#tmp} -ge 4 ] || { warn "ignoring unsuitable temp directory: $tmp"; continue; }
+        dirs="$dirs$tmp"$'\n'
+    done
+
+    while IFS= read -r tmp; do
+        [ -n "$tmp" ] || continue
+        [ -d "$tmp" ] || continue
+        [ -w "$tmp" ] || continue
+        say "$tmp"
+        safe_prefixes="$safe_prefixes$tmp"$'\n'
+        for pattern in "${tmp_patterns[@]}"; do
+            while IFS= read -r -d '' path; do
+                [ -n "$path" ] || continue
+                # Sockets stay, however old they look. A live vscode-ipc-*.sock
+                # cannot be told from an abandoned one here - /proc lists an open
+                # unix socket by inode, never by path - and removing a live one
+                # drops the editor's connection.
+                if [ -S "$path" ] || [ -p "$path" ] || [ -L "$path" ]; then continue; fi
+                path_in_use "$path" && continue
+                discard "$path" "stale temp"
+            done < <(find "$tmp" -mindepth 1 -maxdepth 1 -user "$UID_SELF" -name "$pattern" \
+                -mtime "+$TMP_MIN_AGE_DAYS" -print0 2>/dev/null || true)
+        done
+    done <<<"$dirs"
+}
+
+# --- locking -------------------------------------------------------------------
+
+# The lock lives in a directory only we can write to - never in a shared /tmp,
+# where anyone could park a directory on the name and block every future run.
+lock_path() {
+    local base=${XDG_RUNTIME_DIR:-}
+    if [ -z "$base" ] || [ ! -d "$base" ] || [ ! -w "$base" ]; then
+        base="${XDG_CACHE_HOME:-$HOME/.cache}"
+        mkdir -p "$base" 2>/dev/null || base=$HOME
+    fi
+    printf '%s/.%s.lock' "${base%/}" "$PROGRAM_NAME"
+}
+
+acquire_lock() {
+    local owner
+    lock_dir=$(lock_path)
+
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        owner=$(head -n1 "$lock_dir/pid" 2>/dev/null | tr -dc '0-9' || true)
+        if [ -n "$owner" ] && [ "$owner" -gt 1 ] 2>/dev/null && kill -0 "$owner" 2>/dev/null; then
+            die "another run is in progress (pid $owner)"
+        fi
+        rm -rf -- "$lock_dir"
+        mkdir "$lock_dir" 2>/dev/null || die "cannot acquire lock at $lock_dir"
+    fi
+    lock_held=1
+    trap release_lock EXIT
+    trap 'release_lock; exit 130' INT TERM HUP
+    printf '%s\n' "$$" >"$lock_dir/pid" 2>/dev/null || true
+}
+
+release_lock() {
+    [ "$lock_held" -eq 1 ] || return 0
+    lock_held=0
+    rm -rf -- "$lock_dir" 2>/dev/null || true
+}
+
+# --- scheduling ----------------------------------------------------------------
+
+install_binary() {
+    local bin="$HOME/.local/bin/$PROGRAM_NAME" staged
+    if [ ! "$SELF_PATH" -ef "$bin" ]; then
+        mkdir -p "$HOME/.local/bin"
+        # Copied to a name of its own and moved into place, never written
+        # straight onto $bin: cp writes *through* a symlink, so a link somebody
+        # left on that name would send the copy to whatever it points at instead
+        # of being replaced by it. mv replaces the link itself.
+        staged="$bin.new.$$"
+        if ! { cp -f -- "$SELF_PATH" "$staged" &&
+               chmod 755 "$staged" &&
+               mv -f -- "$staged" "$bin"; }; then
+            rm -f -- "$staged"
+            die "could not install $bin"
+        fi
+    fi
+    printf '%s' "$bin"
+}
+
+# A value is pasted into a crontab by hand, so it has to survive a shell: a
+# single quote inside one would otherwise close the quoting and hand the rest of
+# the line to cron as something else entirely.
+shell_quote() {
+    local s=${1//\'/\'\\\'\'}
+    printf "'%s'" "$s"
+}
+
+# -r names the roots outright, where IDE_SERVER_ROOTS only adds to the ones
+# found by auto-detection. Writing the former into the latter is how a timer
+# ends up sweeping trees the run tried by hand never looked at, so they travel
+# into the unit as the argument they were given as.
+root_args() {
+    local root
+    while IFS= read -r root; do
+        [ -n "$root" ] && printf '%s\n' "$root"
+    done <<<"$explicit_roots"
+    return 0
+}
+
+cron_hint() {
+    local name value prefix='' root
+    while IFS=$'\t' read -r name value; do
+        [ -n "$name" ] && prefix="$prefix$name=$(shell_quote "$value") "
+    done < <(set_tunables)
+    printf '30 4 * * * %s%s --quiet' "$prefix" "$1"
+    while IFS= read -r root; do
+        printf ' --root %s' "$(shell_quote "$root")"
+    done < <(root_args)
+}
+
+# The timer starts from an empty environment, so whatever tunables this
+# invocation carries have to be written into the unit - otherwise --install
+# would quietly schedule a run configured differently from the one just tested.
+report_tunables() {
+    local name value shown=0
+    while IFS=$'\t' read -r name value; do
+        [ -n "$name" ] || continue
+        [ "$shown" -eq 0 ] && say "  carrying over:"
+        shown=1
+        say "    $name=$value"
+    done < <(set_tunables)
+    while IFS= read -r name; do
+        [ "$shown" -eq 0 ] && say "  carrying over:"
+        shown=1
+        say "    --root $name"
+    done < <(root_args)
+    return 0
+}
+
+install_timer() {
+    local bin
+    bin=$(install_binary)
+    case "$(uname -s)" in
+        Darwin) install_launchd "$bin" ;;
+        *) install_systemd "$bin" ;;
+    esac
+    report_tunables
+}
+
+uninstall_timer() {
+    case "$(uname -s)" in
+        Darwin) uninstall_launchd ;;
+        *) uninstall_systemd ;;
+    esac
+}
+
+systemd_unit_dir() { printf '%s/systemd/user' "${XDG_CONFIG_HOME:-$HOME/.config}"; }
+
+systemd_quote() {
+    local s=${1//\\/\\\\}
+    printf '%s' "${s//\"/\\\"}"
+}
+
+systemd_environment() {
+    local name value
+    while IFS=$'\t' read -r name value; do
+        [ -n "$name" ] || continue
+        printf 'Environment="%s=%s"\n' "$name" "$(systemd_quote "$value")"
+    done < <(set_tunables)
+    return 0
+}
+
+# systemd splits ExecStart on whitespace unless the argument is quoted, so a
+# root with a space in it would arrive as two paths, neither of them a directory.
+systemd_exec_start() {
+    local bin=$1 root
+    printf 'ExecStart="%s" --quiet' "$(systemd_quote "$bin")"
+    while IFS= read -r root; do
+        printf ' --root "%s"' "$(systemd_quote "$root")"
+    done < <(root_args)
+    printf '\n'
+}
+
+install_systemd() {
+    local bin=$1 units
+    command -v systemctl >/dev/null 2>&1 ||
+        die "no systemd here; add a cron entry instead: $(cron_hint "$bin")"
+    units=$(systemd_unit_dir)
+    mkdir -p "$units"
+
+    {
+        cat <<EOF
+[Unit]
+Description=Prune stale remote IDE server installs
+
+[Service]
+Type=oneshot
+Nice=10
+IOSchedulingClass=idle
+EOF
+        systemd_environment
+        systemd_exec_start "$bin"
+    } >"$units/$PROGRAM_NAME.service"
+
+    cat >"$units/$PROGRAM_NAME.timer" <<EOF
+[Unit]
+Description=Daily prune of stale remote IDE server installs
+
+[Timer]
+OnCalendar=*-*-* 04:30
+Persistent=true
+RandomizedDelaySec=30m
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl --user daemon-reload 2>/dev/null ||
+        die "no systemd user session here; add a cron entry instead: $(cron_hint "$bin")"
+    systemctl --user enable --now "$PROGRAM_NAME.timer"
+    if command -v loginctl >/dev/null 2>&1; then
+        loginctl enable-linger "$(id -un)" 2>/dev/null ||
+            warn "could not enable linger; the timer runs only while you are logged in"
+    fi
+    say "installed $bin and enabled $PROGRAM_NAME.timer"
+    systemctl --user list-timers "$PROGRAM_NAME.timer" --no-pager 2>/dev/null || true
+}
+
+uninstall_systemd() {
+    local units
+    units=$(systemd_unit_dir)
+    systemctl --user disable --now "$PROGRAM_NAME.timer" 2>/dev/null || true
+    rm -f "$units/$PROGRAM_NAME.timer" "$units/$PROGRAM_NAME.service"
+    systemctl --user daemon-reload 2>/dev/null || true
+    say "removed timer units (binary at $HOME/.local/bin/$PROGRAM_NAME left in place)"
+}
+
+launchd_label() { printf 'local.%s' "$PROGRAM_NAME"; }
+launchd_plist() { printf '%s/Library/LaunchAgents/%s.plist' "$HOME" "$(launchd_label)"; }
+
+xml_escape() {
+    local s=$1
+    s=${s//&/&amp;}
+    s=${s//</&lt;}
+    s=${s//>/&gt;}
+    printf '%s' "$s"
+}
+
+launchd_root_args() {
+    local root
+    while IFS= read -r root; do
+        printf '        <string>--root</string><string>%s</string>\n' "$(xml_escape "$root")"
+    done < <(root_args)
+    return 0
+}
+
+launchd_environment() {
+    local name value body=''
+    while IFS=$'\t' read -r name value; do
+        [ -n "$name" ] || continue
+        body="$body        <key>$(xml_escape "$name")</key><string>$(xml_escape "$value")</string>"$'\n'
+    done < <(set_tunables)
+    [ -n "$body" ] || return 0
+    printf '    <key>EnvironmentVariables</key>\n    <dict>\n%s    </dict>\n' "$body"
+}
+
+install_launchd() {
+    local bin=$1 plist label
+    label=$(launchd_label)
+    plist=$(launchd_plist)
+    mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+
+    {
+        cat <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$label</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$(xml_escape "$bin")</string>
+        <string>--quiet</string>
+EOF
+        launchd_root_args
+        cat <<EOF
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key><integer>4</integer>
+        <key>Minute</key><integer>30</integer>
+    </dict>
+EOF
+        launchd_environment
+        cat <<EOF
+    <key>Nice</key><integer>10</integer>
+    <key>LowPriorityIO</key><true/>
+    <key>ProcessType</key><string>Background</string>
+    <key>StandardOutPath</key><string>$HOME/Library/Logs/$PROGRAM_NAME.log</string>
+    <key>StandardErrorPath</key><string>$HOME/Library/Logs/$PROGRAM_NAME.log</string>
+</dict>
+</plist>
+EOF
+    } >"$plist"
+
+    launchctl bootout "gui/$UID_SELF/$label" >/dev/null 2>&1 || true
+    if ! launchctl bootstrap "gui/$UID_SELF" "$plist" 2>/dev/null; then
+        launchctl load -w "$plist" 2>/dev/null ||
+            die "could not load $plist; add a cron entry instead: $(cron_hint "$bin")"
+    fi
+    say "installed $bin and loaded $label (daily 04:30, log in ~/Library/Logs/$PROGRAM_NAME.log)"
+}
+
+uninstall_launchd() {
+    local plist label
+    label=$(launchd_label)
+    plist=$(launchd_plist)
+    launchctl bootout "gui/$UID_SELF/$label" >/dev/null 2>&1 ||
+        launchctl unload -w "$plist" >/dev/null 2>&1 || true
+    rm -f "$plist"
+    say "removed $label (binary at $HOME/.local/bin/$PROGRAM_NAME left in place)"
+}
+
+# --- main ----------------------------------------------------------------------
+
+main() {
+    local roots root before_kb after_kb
+
+    roots=$(resolve_roots)
+
+    while IFS= read -r root; do
+        [ -n "$root" ] && safe_prefixes="$safe_prefixes$root"$'\n'
+    done <<<"$roots"
+
+    ps_refresh
+    collect_protected_pids
+
+    if [ "$PROTECT_LIVE" -eq 1 ] && [ "$protect_live_auto" -eq 1 ]; then
+        say "no terminal attached - leaving every running server alone"
+    fi
+
+    if [ -z "$roots" ]; then
+        say "no IDE server roots found"
+    else
+        while IFS= read -r root; do
+            [ -n "$root" ] || continue
+            before_kb=$(size_kb "$root")
+            say "$root  ($(human "$before_kb"))"
+            prune_servers "$root"
+            prune_data_caches "$root"
+            prune_extensions "$root"
+            prune_workspace_storage "$root"
+            after_kb=$(size_kb "$root")
+            say "  now $(human "$after_kb")"
+        done <<<"$roots"
+    fi
+
+    prune_tmp
+
+    if [ "$dry_run" -eq 1 ]; then
+        printf '%s: would free %s\n' "$PROGRAM_NAME" "$(human "$freed_kb")"
+    else
+        printf '%s: freed %s\n' "$PROGRAM_NAME" "$(human "$freed_kb")"
+    fi
+    return "$had_error"
+}
+
+if [ -z "${BASH_VERSION:-}" ]; then
+    printf 'ide-server-prune: needs bash\n' >&2
+    exit 1
+fi
+
+# Every root, every guard and the lock itself are anchored to $HOME. Without one
+# the script would still refuse to remove anything - the roots it looks for are
+# all under it - but it would say so as a bare "unbound variable" from somewhere
+# in the middle of the file. Ask once, plainly, before anything else runs.
+[ -n "${HOME:-}" ] && [ -d "$HOME" ] ||
+    die "HOME must name an existing directory (got: '${HOME:-}')"
+
+UID_SELF=$(id -u)
+PGID_SELF=$( { ps -o pgid= -p $$ 2>/dev/null || printf '%s' "$$"; } | tr -d ' ' | head -n1)
+SELF_PATH=$(readlink -f "$0" 2>/dev/null || abs_file "$0")
+# Symlink-resolved, because every path this script compares against $HOME has
+# been through pwd -P: on a host where /home/you is a link to /data/home/you the
+# literal spelling would never match the thing it is meant to protect.
+HOME_REAL=$(abs_dir "$HOME")
+if [ -d "/proc/$$" ]; then proc_fs=1; fi
+readonly UID_SELF PGID_SELF SELF_PATH HOME_REAL
+
+# Options that have an environment twin set both, so that a run tried by hand and
+# then handed to --install schedules the settings that were actually tried.
+while [ $# -gt 0 ]; do
+    case $1 in
+        -n|--dry-run) dry_run=1 ;;
+        -q|--quiet) quiet=1 ;;
+        -k|--keep)
+            [ -n "${2:-}" ] || die "--keep needs a number"
+            KEEP_SERVERS=$2; IDE_KEEP_SERVERS=$2; shift ;;
+        -r|--root)
+            [ -n "${2:-}" ] || die "--root needs a path"
+            # The list these accumulate into is newline-separated, and --install
+            # writes each one onto a line of its own as well.
+            case $2 in *$'\n'*) die "--root path must not contain a newline" ;; esac
+            # Absolute, because --install carries this into a unit that starts
+            # from a different working directory: a relative path would land in
+            # the timer and be silently skipped there on every scheduled run.
+            root_path=$(abs_dir "$2")
+            explicit_roots="$explicit_roots$root_path"$'\n'; shift ;;
+        -p|--protect-live) PROTECT_LIVE=1; IDE_PROTECT_LIVE=1 ;;
+        --no-protect-live) PROTECT_LIVE=0; IDE_PROTECT_LIVE=0 ;;
+        --install) action=install ;;
+        --uninstall) action=uninstall ;;
+        -V|--version) printf '%s %s\n' "$PROGRAM_NAME" "$VERSION"; exit 0 ;;
+        -h|--help) usage; exit 0 ;;
+        *) die "unknown option: $1 (try --help)" ;;
+    esac
+    shift
+done
+
+# Being root is not itself wrong - plenty of small hosts are used that way, and
+# then the server tree really does belong to root. Arriving through sudo is: the
+# tree, the processes and the timer all belong to the user who called it, and
+# every one of them would be handled here under the wrong identity.
+[ -z "${SUDO_USER:-}" ] ||
+    die "run this as ${SUDO_USER}, the user that owns the server tree, not through sudo"
+
+validate_tunables
+resolve_protect_live
+
+# --dry-run promises that nothing changes. Installing a timer writes a binary, a
+# unit and a registration with the service manager, so the two cannot be combined
+# - and silently ignoring one of them is how a "look first" run ends up having
+# scheduled something.
+case $action in
+    install)
+        [ "$dry_run" -eq 0 ] || die "--dry-run and --install cannot be combined"
+        install_timer; exit 0 ;;
+    uninstall)
+        [ "$dry_run" -eq 0 ] || die "--dry-run and --uninstall cannot be combined"
+        uninstall_timer; exit 0 ;;
+esac
+
+acquire_lock
+main
