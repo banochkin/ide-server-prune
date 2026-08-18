@@ -1012,6 +1012,52 @@ for spelling in Linux Darwin; do
     esac
 done
 
+# Enabling linger goes through polkit, which refuses a session it does not
+# consider active - and a minimal VPS image ships no polkitd at all. The warning
+# has to fire there, carry the command that fixes it, and stay quiet where
+# linger is already on: that call is refused on such a host too, and a warning
+# printed on every re-install is one nobody reads on the install where it means
+# something.
+printf '\nlinger that could not be enabled is reported with the fix:\n'
+mkdir -p "$work/bin-lg" "$work/home-lg"
+for stub in systemctl launchctl; do
+    printf '#!/bin/sh\nexit 0\n' >"$work/bin-lg/$stub"
+    chmod 755 "$work/bin-lg/$stub"
+done
+printf '#!/bin/sh\necho Linux\n' >"$work/bin-lg/uname"
+chmod 755 "$work/bin-lg/uname"
+cat >"$work/bin-lg/loginctl" <<'STUB'
+#!/bin/sh
+case $1 in
+    enable-linger) exit 1 ;;
+    show-user) echo "Linger=${LINGER_STATE:-no}" ;;
+    *) exit 1 ;;
+esac
+STUB
+chmod 755 "$work/bin-lg/loginctl"
+out=$(env PATH="$work/bin-lg:$PATH" HOME="$work/home-lg" \
+          XDG_CONFIG_HOME="$work/home-lg/.config" LINGER_STATE=no \
+          "$prune" --install 2>&1)
+case "$out" in
+    *"linger is not enabled"*) printf '  ok    the refusal is reported\n' ;;
+    *) printf '  FAIL  a refused enable-linger went unmentioned\n'; failures=$(( failures + 1 )) ;;
+esac
+case "$out" in
+    *"sudo loginctl enable-linger"*) printf '  ok    with the command that fixes it\n' ;;
+    *) printf '  FAIL  no fix offered\n'; failures=$(( failures + 1 )) ;;
+esac
+
+# The same refusal, on a host where linger is already on. The status of the call
+# is identical; only the state differs, which is why the state is what is asked.
+printf '\nlinger that is already on is not reported at all:\n'
+out=$(env PATH="$work/bin-lg:$PATH" HOME="$work/home-lg" \
+          XDG_CONFIG_HOME="$work/home-lg/.config" LINGER_STATE=yes \
+          "$prune" --install 2>&1)
+case "$out" in
+    *linger*) printf '  FAIL  cried wolf where linger is enabled\n'; failures=$(( failures + 1 )) ;;
+    *) printf '  ok    silent\n' ;;
+esac
+
 # Registering a launchd agent starts by unloading the one already there, and
 # bootstrap is exactly the step that fails over SSH to a headless Mac. A failure
 # there must not leave the host with no timer at all.

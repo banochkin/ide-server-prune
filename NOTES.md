@@ -152,6 +152,15 @@ Do not "fix" these without reading the reasoning first.
   `report_config_drift()`: read the old unit before overwriting it and name
   every setting that this call drops or changes. Announce the revert, do not
   prevent it.
+- **A warning is driven by state, not by the status of the call that failed.**
+  `loginctl enable-linger` is refused by polkit on a host where linger is
+  already enabled, so reporting the call's status warned loudest exactly where
+  nothing was wrong — and a warning that fires on every re-install is one nobody
+  reads on the install where it is true. `report_linger()` asks
+  `loginctl show-user`, falls back to `/var/lib/systemd/linger/<user>` only when
+  logind will not answer at all, and prints the `sudo` command rather than
+  taking the privilege. Same shape as invariant 5: a guard has to be tested
+  against both answers.
 - **Exit status 1 after a refusal is intentional.** `had_error` makes a timer log
   a failed unit, which is the point.
 - **`freed_kb` counts in `--dry-run` too.** It is a projection, not a claim about
@@ -159,11 +168,11 @@ Do not "fix" these without reading the reasoning first.
 
 ## Verified
 
-Everything below was exercised against 2.7, not reasoned about.
+Everything below was exercised against 2.8, not reasoned about.
 
 | | |
 | --- | --- |
-| `selftest` | 119 checks, all passing, no skips |
+| `selftest` | 122 checks, all passing, no skips |
 | Shells | bash 5.2.21 and stock `/bin/bash` 3.2.57 |
 | Host | macOS 26.6, arm64 |
 | Linux | full suite green on 6.8, x86_64 (bash 5.2.21, GNU coreutils 9.4, findutils 4.9.0) — **last run against 2.6**; 2.7 has not been on a Linux host yet |
@@ -192,6 +201,13 @@ refused, targets intact); `../../../outside` in `.obsolete`; a process behind a
 symlinked parent (unsignalled since 2.4); `TMPDIR` set to `$HOME`, to a parent of
 `$HOME`, and to `/usr`; unset and non-existent `HOME`; `--install` over a symlink;
 a cron hint containing an apostrophe and a path with a space.
+
+Field-verified for 2.8: the fleet of five (macOS studio, four Linux VPS) all
+updated 2.6 → 2.7 by hand, each reporting `carrying over: nothing`, which is
+what surfaced the linger problem on one host — polkit refusing
+`set-self-linger` with no `polkitd` reachable, fixed there with
+`sudo loginctl enable-linger`. That host is being decommissioned; the behaviour
+it exposed is not specific to it and is what 2.8 addresses.
 
 Run by hand for 2.7: a re-install under stock `/bin/bash` 3.2.57 reading back a
 `systemd` value carrying a double quote and a `plist` value carrying `&` and

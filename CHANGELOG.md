@@ -4,6 +4,50 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project uses a
 plain `major.minor` version printed by `--version`.
 
+## [2.8] — 2026-08-18
+
+Fallout from putting 2.7 on the fleet. One host of five refused
+`loginctl enable-linger`, which means its timer only fires while somebody is
+logged in — and the line saying so went past unread, in the middle of the
+install output, with no advice attached. On a minimal VPS image that is the
+default outcome, not the exception.
+
+### Fixed
+
+- **The linger warning was driven by the wrong question.** It reported the
+  status of the `enable-linger` call, and that call is refused on a host where
+  linger is *already on* — polkit answers about the right to perform the action,
+  not about the state. So the host that was correctly configured got a warning
+  on every single `--install`, which is how the one install where the warning is
+  true gets ignored. The state is now what is asked, of `loginctl show-user`
+  first and of the flag file logind keeps when logind will not answer at all.
+- **The warning said nothing about what to do.** It now carries the command:
+  `enable it with: sudo loginctl enable-linger <user>`. The script does not take
+  that privilege itself, and printing the command is the whole of the remedy.
+- **It was printed where it would be missed** — mid-run, followed by the
+  `list-timers` table and the carry-over report. It comes last now, so it is the
+  line still on screen when the command returns.
+- **`systemctl --user enable --now` was unchecked.** Under `set -e` a failure
+  there ended the run on the status alone: no message, no cron hint, and a unit
+  file already on disk implying the job exists. It fails the way every other
+  step in that function does now.
+
+### Changed
+
+- `--version` reports 2.8. The project versions `major.minor`, so a fix this
+  size is a minor bump rather than a patch level that the scheme has no room
+  for.
+
+### Tests
+
+`selftest` grew from 119 to 122 checks. A stub `loginctl` that refuses
+`enable-linger` covers both directions of the state it then reports: with
+`Linger=no` the warning fires and carries the `sudo` command, with `Linger=yes`
+the run is silent — identical call status, opposite state, which is the point of
+the fix. The fixture directories are deliberately not named after the word being
+grepped for; the first draft of the check passed on a path called `home-linger`
+rather than on the message.
+
 ## [2.7] — 2026-08-18
 
 A question about `--install` — "if I run it again on a host that already has it,

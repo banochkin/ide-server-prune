@@ -11,7 +11,7 @@ shopt -s nullglob
 unset CDPATH
 
 PROGRAM_NAME=${0##*/}
-VERSION=2.7
+VERSION=2.8
 COMMIT_RE='[0-9a-f]{40}'
 ENTRY_RE='[A-Za-z][A-Za-z0-9]*-[0-9a-f]{40}(\.staging)?'
 # Every tunable, in the order the help text lists them. --install writes the
@@ -1394,13 +1394,50 @@ EOF
 
     systemctl --user daemon-reload 2>/dev/null ||
         die "no systemd user session here; add a cron entry instead: $(cron_hint "$bin")"
-    systemctl --user enable --now "$PROGRAM_NAME.timer"
-    if command -v loginctl >/dev/null 2>&1; then
-        loginctl enable-linger "$(id -un)" 2>/dev/null ||
-            warn "could not enable linger; the timer runs only while you are logged in"
-    fi
+    # Not left to set -e: a failure here would end the run on the status alone,
+    # with no message and a unit file already on disk to suggest otherwise.
+    systemctl --user enable --now "$PROGRAM_NAME.timer" ||
+        die "could not enable $PROGRAM_NAME.timer; add a cron entry instead: $(cron_hint "$bin")"
     say "installed $bin and enabled $PROGRAM_NAME.timer"
     systemctl --user list-timers "$PROGRAM_NAME.timer" --no-pager 2>/dev/null || true
+    report_linger
+}
+
+# Whether the user's services may run with nobody logged in. Asked of the state
+# rather than of the call that tries to set it: the call is refused on hosts
+# where the state is already what we want. logind is the authority and is
+# believed in both directions; the flag file it keeps on disk is the answer only
+# where logind will not talk to us at all.
+linger_enabled() {
+    local user=$1 state
+    state=$( { loginctl show-user "$user" --property=Linger 2>/dev/null || true; } )
+    case $state in
+        *=yes) return 0 ;;
+        *=no) return 1 ;;
+    esac
+    [ -e "/var/lib/systemd/linger/$user" ]
+}
+
+# Enabling linger goes through polkit, and polkit says yes only to a session it
+# considers active. A minimal VPS image ships no polkitd at all, and then the
+# call is refused outright with nobody to authenticate to - which is how a timer
+# ends up silently firing only while somebody is logged in.
+#
+# The warning is therefore driven by the state and not by the status of the call
+# that just failed: a host where linger was set by hand refuses that call every
+# single time, and a warning that cries wolf on every re-install is one nobody
+# reads on the install where it is true. Said last, after the timer listing, so
+# it is the line still on screen when the command returns - and with the command
+# that fixes it, which needs a privilege this script deliberately does not take.
+report_linger() {
+    local user
+    command -v loginctl >/dev/null 2>&1 || return 0
+    user=$(id -un)
+    loginctl enable-linger "$user" >/dev/null 2>&1 || true
+    linger_enabled "$user" && return 0
+    warn "linger is not enabled for $user: the timer only fires while you are logged in"
+    warn "enable it with: sudo loginctl enable-linger $user"
+    return 0
 }
 
 uninstall_systemd() {

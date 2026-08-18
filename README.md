@@ -294,7 +294,21 @@ call succeeds. A re-install that fails leaves you the timer you already had.
 
 Note for Linux: the installer calls `loginctl enable-linger` for your user, which
 is what lets the timer fire while you are not logged in. It also means your other
-user services keep running after logout. Check the result with:
+user services keep running after logout.
+
+That call goes through polkit, and polkit says yes only to a session it
+considers active — a minimal VPS image often ships no `polkitd` at all, and then
+it is refused outright with nobody to authenticate to. The installer checks the
+resulting *state* rather than the status of that call, so it stays quiet where
+linger is already on and says this where it is not:
+
+```
+ide-server-prune: linger is not enabled for you: the timer only fires while you are logged in
+ide-server-prune: enable it with: sudo loginctl enable-linger you
+```
+
+Run that one command and the timer is unattended for good; the script does not
+take the privilege itself. Check the result with:
 
 ```sh
 systemctl --user list-timers ide-server-prune.timer
