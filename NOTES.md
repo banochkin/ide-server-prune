@@ -40,6 +40,12 @@ Break one of these and the tool stops being safe to run on a live host.
    `lru.json` rewrite and the timer. It does take the lock, which is the one
    thing it creates — deliberately, so its report describes a tree no concurrent
    run is changing underneath it.
+8. **Replacing something that already works has to be reversible.** `--install`
+   on a host that already has a timer takes the working registration apart
+   before it puts the new one together, and the step that puts it together is
+   the one that fails on a headless Mac. Anything added on that path — a second
+   service manager, another platform — keeps a copy of what it displaced and
+   puts it back before it calls `die()`.
 
 ## Shell traps this code is shaped around
 
@@ -136,6 +142,16 @@ Do not "fix" these without reading the reasoning first.
   hex digits means the file is not the format we know; decoding it by hand turns
   `100%done` into a path that cannot exist, which is exactly the answer that makes
   the caller delete something.
+- **The unit describes the call that wrote it, and nothing else.** A second
+  `--install` with a barer command line schedules a barer run: the settings the
+  first one carried are gone from the regenerated unit. It is tempting to "fix"
+  this by merging the settings already installed into the new unit, and that
+  trade is worse than it looks — once a unit remembers a setting there is no
+  spelling left that means "go back to the default", and `--install` stops being
+  a description of a run you just tried by hand. What 2.7 added instead is
+  `report_config_drift()`: read the old unit before overwriting it and name
+  every setting that this call drops or changes. Announce the revert, do not
+  prevent it.
 - **Exit status 1 after a refusal is intentional.** `had_error` makes a timer log
   a failed unit, which is the point.
 - **`freed_kb` counts in `--dry-run` too.** It is a projection, not a claim about
@@ -143,14 +159,14 @@ Do not "fix" these without reading the reasoning first.
 
 ## Verified
 
-Everything below was exercised against 2.6, not reasoned about.
+Everything below was exercised against 2.7, not reasoned about.
 
 | | |
 | --- | --- |
-| `selftest` | 108 checks, all passing, no skips |
+| `selftest` | 119 checks, all passing, no skips |
 | Shells | bash 5.2.21 and stock `/bin/bash` 3.2.57 |
 | Host | macOS 26.6, arm64 |
-| Linux | full suite green on 6.8, x86_64 (bash 5.2.21, GNU coreutils 9.4, findutils 4.9.0) |
+| Linux | full suite green on 6.8, x86_64 (bash 5.2.21, GNU coreutils 9.4, findutils 4.9.0) — **last run against 2.6**; 2.7 has not been on a Linux host yet |
 
 The Linux run is what turned up the two bugs 2.6 fixes, and one bug in the
 harness: the stub standing in for a working GNU `stat` delegated to the BSD
@@ -177,6 +193,13 @@ symlinked parent (unsignalled since 2.4); `TMPDIR` set to `$HOME`, to a parent o
 `$HOME`, and to `/usr`; unset and non-existent `HOME`; `--install` over a symlink;
 a cron hint containing an apostrophe and a path with a space.
 
+Run by hand for 2.7: a re-install under stock `/bin/bash` 3.2.57 reading back a
+`systemd` value carrying a double quote and a `plist` value carrying `&` and
+`<` — the two escapings `systemd_unquote()` and `xml_unescape()` have to undo,
+and the two that a naive two-pass substitution gets wrong. Both branches were
+driven from macOS through a stub `uname`, which is now how `selftest` reaches
+them as well.
+
 Run by hand for 2.5 and not (yet) in `selftest`: roots whose path carries a
 space, an apostrophe, a backslash, `..` inside a component, and each of
 `( ) + [ ] *` — the run behaves identically and exits 0, which is what
@@ -196,11 +219,21 @@ main shell to move. Exactly one `rm -rf` acts on pruning targets
 
 ## Still open
 
-- The systemd branch of `--install` is still only exercised through stubs. The
-  unit it writes is now checked by `systemd-analyze verify` on a real Linux
-  host, so the file is known to be valid, but `systemctl --user daemon-reload`,
+- The systemd branch of `--install` is still only exercised through stubs — on
+  either platform now, since 2.7 reaches it through a stub `uname`. The unit it
+  writes is checked by `systemd-analyze verify` on a real Linux host, so the
+  file is known to be valid, but `systemctl --user daemon-reload`,
   `systemctl --user enable --now` and `loginctl enable-linger` have never been
-  observed to succeed against a live service manager — only to be called.
+  observed to succeed against a live service manager — only to be called. The
+  same now goes for the launchd restore path: the stub `launchctl` reports
+  success, so what is verified is that the previous plist is back on disk and
+  that a load is attempted, not that launchd accepts it.
+- `report_config_drift()` compares against the unit on disk, so a unit edited by
+  hand is read as "what was installed" — which is right for the systemd
+  `Environment=` lines and the `--root` arguments it knows, and blind to
+  anything else somebody added there. A hand-edited unit is silently discarded
+  by the next `--install`, exactly as before; only the settings we ourselves
+  write are named on the way out.
 - `IDE_SERVER_ROOTS` is colon-separated, so a root containing a `:` cannot be
   expressed. `-r` has no such limit; the variable would need a different
   separator, which is a compatibility break.

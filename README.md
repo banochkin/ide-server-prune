@@ -162,7 +162,9 @@ Either way, start by looking before you leap:
 `--install` does the copying for you: it places the script at
 `~/.local/bin/ide-server-prune` and enables the daily job described under
 [Scheduling](#scheduling). There is no separate copy step to run first, and
-running it a second time is harmless.
+running it a second time is harmless: the unit is rewritten rather than
+duplicated, and no prune is triggered. Upgrading later is the same command —
+[Updating](#updating) covers what to repeat along with it.
 
 ### Route 2 — just the command, no job
 
@@ -231,9 +233,11 @@ ide-server-prune --install
 It enables a daily 04:30 job: a
 `systemd --user` timer on Linux (with `Persistent=true`, so a host that was off
 catches up) or a launchd agent on macOS logging to
-`~/Library/Logs/ide-server-prune.log`. `--install` is idempotent and
-`--uninstall` removes the job. Where neither init system is available the script
-prints a ready-made cron line instead.
+`~/Library/Logs/ide-server-prune.log`. Running it twice adds nothing twice —
+the unit is rewritten, not duplicated, and the timer is enabled rather than
+started, so a re-install never triggers a prune. `--uninstall` removes the job.
+Where neither init system is available the script prints a ready-made cron line
+instead.
 
 The job starts from an empty environment, so `--install` writes whatever settings
 the invocation carries into the unit it generates and prints them back to you.
@@ -243,6 +247,31 @@ Tune the run by hand first, then install exactly that:
 IDE_KEEP_SERVERS=1 ide-server-prune --dry-run
 IDE_KEEP_SERVERS=1 ide-server-prune --install
 ```
+
+The unit therefore describes *the call that wrote it*, and nothing else: a
+second `ide-server-prune --install` with a barer command line schedules a barer
+run, and the `IDE_KEEP_SERVERS=1` above is gone from it. That is deliberate —
+a unit that remembered its settings could never be talked out of one — so what
+the tool does instead is say so:
+
+```
+  carrying over: nothing - the scheduled run uses the built-in defaults and auto-detected roots
+ide-server-prune: IDE_KEEP_SERVERS=1 was in the installed timer; this run does not set it, so
+  the scheduled run falls back to the built-in default
+ide-server-prune: the timer now matches this invocation - re-run --install with the earlier
+  settings to put them back
+```
+
+Every setting the new unit drops or changes is named, on stderr, read back from
+the unit that was there a moment ago; repeating the *same* `--install` says
+nothing, because nothing moved. To see what is scheduled right now without
+touching it: `systemctl --user cat ide-server-prune.service`, or
+`cat ~/Library/LaunchAgents/local.ide-server-prune.plist` on macOS.
+
+`--install` also copies the script it is being run from over
+`~/.local/bin/ide-server-prune`. Run it out of an older checkout and the
+installed copy goes back a version — it says which version it is replacing when
+the two differ.
 
 The generated cron line, on hosts without either init system, is prefixed the
 same way, and every value in it is quoted so the line survives being pasted into
@@ -258,7 +287,10 @@ Note for macOS: `--install` registers the agent with `launchctl bootstrap
 gui/<uid>`, which needs a GUI session for that user — over SSH to a headless Mac
 that usually means somebody has to be logged in at the console. Where it fails
 the script tries the older `launchctl load -w`, and if that fails too it stops
-and prints a cron line to use instead. Nothing is left half-registered.
+and prints a cron line to use instead. Nothing is left half-registered:
+registering a new agent means unloading the one already there, so the plist that
+was working is kept aside first and put back — and loaded again — if neither
+call succeeds. A re-install that fails leaves you the timer you already had.
 
 Note for Linux: the installer calls `loginctl enable-linger` for your user, which
 is what lets the timer fire while you are not logged in. It also means your other
@@ -268,6 +300,49 @@ user services keep running after logout. Check the result with:
 systemctl --user list-timers ide-server-prune.timer
 journalctl --user -u ide-server-prune -n 20
 ```
+
+## Updating
+
+Updating is the install again, run out of a fresh copy of the repository:
+
+```sh
+git clone https://github.com/banochkin/ide-server-prune.git ~/ide-server-prune
+~/ide-server-prune/ide-server-prune --install
+```
+
+Where that clone already exists, `git -C ~/ide-server-prune pull` first and run
+the same second line. `--install` copies the script it is being run from over
+`~/.local/bin/ide-server-prune`, rewrites the unit and re-enables the job.
+Nothing has to be uninstalled first, no prune is triggered, and repeating it
+changes nothing — so it is safe on a host somebody is working on. Confirm with
+`~/.local/bin/ide-server-prune --version`.
+
+It reports two things on stderr, and both are worth reading:
+
+```
+ide-server-prune: replacing /home/you/.local/bin/ide-server-prune (version 2.6) with version 2.7 - the copy being run
+ide-server-prune: IDE_KEEP_SERVERS=1 was in the installed timer; this run does not set it, so the scheduled run falls back to the built-in default
+```
+
+The first line is the update itself. The second means this host had settings:
+the unit describes the call that wrote it, so they have to be repeated —
+`IDE_KEEP_SERVERS=1 ~/ide-server-prune/ide-server-prune --install` puts the
+timer back to what it was. Silence there means there was nothing to carry over.
+
+Several hosts at once:
+
+```sh
+for host in web-1 web-2 build-1; do
+    ssh "$host" 'git -C ~/ide-server-prune pull ||
+                 git clone https://github.com/banochkin/ide-server-prune.git ~/ide-server-prune
+                 ~/ide-server-prune/ide-server-prune --install'
+done
+```
+
+macOS hosts are the exception: registering a launchd agent needs a GUI session
+for that user, which over SSH to a headless Mac usually means somebody has to be
+logged in at the console. Where it fails the update stops and puts the agent that
+was running back, so the host keeps the timer it already had.
 
 ## Tuning
 
@@ -356,10 +431,14 @@ checks that extension versions are then left alone. It touches nothing outside
 its own temporary directory: the scheduling check runs against an isolated
 `HOME` with a stub `launchctl`/`systemctl` on `PATH`, so no real service manager
 is involved — which also covers what `-r` writes into the unit, that `--install`
-does not copy itself through a symlink left on its name, and that the cron line
-printed where neither init system exists parses back into the arguments it was
-built from. The suite runs green on both platforms it targets: macOS 26.6 on
-arm64 and Linux 6.8 on x86_64, with no skipped checks on either.
+does not copy itself through a symlink left on its name, that a second
+`--install` names every setting it drops and stays quiet when it drops none,
+that replacing the installed binary with a differently versioned copy is
+announced, that a launchd registration which fails puts the previous agent back,
+and that the cron line printed where neither init system exists parses back into
+the arguments it was built from. The suite runs green on both platforms it
+targets: macOS 26.6 on arm64 and Linux 6.8 on x86_64, with no skipped checks on
+either.
 
 ## Changelog
 

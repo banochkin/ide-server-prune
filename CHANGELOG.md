@@ -4,6 +4,77 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); the project uses a
 plain `major.minor` version printed by `--version`.
 
+## [2.7] — 2026-08-18
+
+A question about `--install` — "if I run it again on a host that already has it,
+nothing bad happens, right?" — that turned out to be true of everything the
+command *deletes* and not quite true of what it *configures*. Re-installing has
+always regenerated the unit from the environment of the call that runs it, which
+is the whole point of the feature; what it never did was say that the settings
+the previous call had scheduled were being dropped. This release leaves the
+behaviour alone and makes it audible, and repairs the one place where a failed
+re-install left a host worse off than before it.
+
+### Fixed
+
+- **A launchd re-install that failed to register left the host with no timer.**
+  Registering an agent begins by unloading the one already there, so a
+  `bootstrap` that fails — which is the normal outcome over SSH to a headless
+  Mac with nobody at the console — ended the run with the previous agent
+  unloaded, its plist already overwritten, and only a cron hint to show for it.
+  The plist that was working is now kept aside first and put back, and loaded
+  again, when neither `bootstrap` nor `load -w` succeeds. The README's claim that
+  "nothing is left half-registered" is true on that path for the first time.
+- **Unit files were written in place.** A run interrupted mid-write left a
+  half-written `.service`, `.timer` or `.plist` for the service manager to read.
+  Each is now written to a name of its own and moved over the target, the way
+  the installed binary already was.
+
+### Changed
+
+- **A second `--install` names every setting it drops.** The settings the unit
+  already on disk carries are read back before it is rewritten, and any that
+  this invocation drops or changes are reported on stderr:
+  `IDE_KEEP_SERVERS=1 was in the installed timer; this run does not set it, so
+  the scheduled run falls back to the built-in default`. The same for a `--root`
+  that is no longer named. Repeating an identical `--install` says nothing,
+  because nothing moved. The unit is read rather than a note of our own beside
+  it: the unit is what the service manager will actually run.
+- **An empty carry-over list says so** — `carrying over: nothing - the scheduled
+  run uses the built-in defaults and auto-detected roots`. Printing nothing at
+  all and carrying nothing over looked identical on a terminal, and on a host
+  that already has a timer the second is the interesting answer.
+- **Replacing the installed binary with a differently versioned copy is
+  announced.** `--install` copies the script it is being run from over
+  `~/.local/bin/ide-server-prune`; run out of an old checkout it rolled the
+  scheduled job back a version in silence. On stderr, necessarily — the caller
+  reads that function's stdout as its return value.
+- `--version` reports 2.7.
+
+### Tests
+
+`selftest` grew from 108 to 119 checks. New coverage: a second `--install` with
+a barer command line names both the tunable and the root it drops and says the
+carry-over is empty; an identical one reports no drift; installing over a
+differently versioned copy names the version being replaced; a launchd
+registration that fails puts the previous plist back and leaves no backup
+behind. The round trip — write a unit, read it back — is now exercised on *both*
+platforms from either one, through a stub `uname`: until now the branch that was
+not native to the host running the suite was never executed at all, and reading a
+unit back is new code on both sides. Checked by hand under stock `/bin/bash`
+3.2.57 as well, with values carrying a double quote (systemd) and `&` and `<`
+(launchd), which are the two escapings the new readers have to undo.
+
+### Docs
+
+- **The README gained an `Updating` section.** Upgrading an installed host was
+  documented nowhere. The procedure is a fresh clone and `--install` again —
+  easy to guess, and easy to get half right, because the settings live in the
+  unit and have to be repeated with it. Reading the unit beforehand is no longer
+  the first step: this release makes the tool say what it dropped, so the
+  section is the two commands, the two messages they can print, and a loop for
+  several hosts.
+
 ## [2.6] — 2026-08-03
 
 The first run of the full suite on Linux, and the review that went with it. Two

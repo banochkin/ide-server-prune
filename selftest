@@ -927,6 +927,125 @@ case "$unit" in
     *) printf '  FAIL  the root itself is missing from the unit\n'; failures=$(( failures + 1 )) ;;
 esac
 
+# The unit is regenerated from the environment of the call that writes it, so a
+# second --install with a barer command line reverts what the first one
+# scheduled. That stays - a unit that remembered settings could never be talked
+# out of one - but every setting it drops is named on the way out.
+printf '\na second --install with barer settings says what it drops:\n'
+mkdir -p "$work/home-d"
+env PATH="$work/bin:$PATH" HOME="$work/home-d" XDG_CONFIG_HOME="$work/home-d/.config" \
+    IDE_KEEP_SERVERS=1 "$prune" -q -r "$root" --install >/dev/null 2>&1
+out=$(env PATH="$work/bin:$PATH" HOME="$work/home-d" XDG_CONFIG_HOME="$work/home-d/.config" \
+          "$prune" --install 2>&1)
+case "$out" in
+    *"IDE_KEEP_SERVERS=1 was in the installed timer"*)
+        printf '  ok    the dropped tunable is named\n' ;;
+    *) printf '  FAIL  the dropped tunable went unmentioned\n'; failures=$(( failures + 1 )) ;;
+esac
+case "$out" in
+    *"the installed timer ran with --root $real_root"*)
+        printf '  ok    the dropped root is named\n' ;;
+    *) printf '  FAIL  the dropped root went unmentioned\n'; failures=$(( failures + 1 )) ;;
+esac
+# "nothing was printed" and "nothing was carried over" look identical on a
+# terminal, and on a host that already has a timer the second is the answer that
+# matters.
+case "$out" in
+    *"carrying over: nothing"*) printf '  ok    an empty carry-over says so\n' ;;
+    *) printf '  FAIL  an empty carry-over printed nothing at all\n'; failures=$(( failures + 1 )) ;;
+esac
+
+# ... and the same call repeated changes nothing, so it must stay quiet: a
+# warning on every re-install is a warning nobody reads.
+printf '\nrepeating the same --install is silent about drift:\n'
+out=$(env PATH="$work/bin:$PATH" HOME="$work/home-d" XDG_CONFIG_HOME="$work/home-d/.config" \
+          "$prune" --install 2>&1)
+case "$out" in
+    *"installed timer"*)
+        printf '  FAIL  reported drift where there is none\n'; failures=$(( failures + 1 )) ;;
+    *) printf '  ok    no drift reported\n' ;;
+esac
+
+# --install copies whatever it is being run from over the installed name, so
+# running it out of an old checkout rolls the scheduled job back a version.
+printf '\ninstalling over a different version says so:\n'
+mkdir -p "$work/home-v/.local/bin"
+sed 's/^VERSION=.*/VERSION=0.1/' "$prune" >"$work/home-v/.local/bin/ide-server-prune"
+chmod 755 "$work/home-v/.local/bin/ide-server-prune"
+out=$(env PATH="$work/bin:$PATH" HOME="$work/home-v" XDG_CONFIG_HOME="$work/home-v/.config" \
+          "$prune" --install 2>&1)
+case "$out" in
+    *"(version 0.1)"*) printf '  ok    the version being replaced is named\n' ;;
+    *) printf '  FAIL  the binary was replaced in silence\n'; failures=$(( failures + 1 )) ;;
+esac
+
+# Only one of the two scheduling branches is native to whichever host runs this,
+# so the other one is never exercised at all - and reading a unit back is new
+# code on both. A stub `uname` reaches both from either platform: the unit is
+# written from scratch and then read by the same code that reports drift, which
+# fails loudly if either half disagrees with the other about the format.
+printf '\nboth scheduling branches write a unit and read it back:\n'
+for spelling in Linux Darwin; do
+    mkdir -p "$work/bin-$spelling" "$work/home-$spelling"
+    for stub in launchctl systemctl loginctl; do
+        printf '#!/bin/sh\nexit 0\n' >"$work/bin-$spelling/$stub"
+        chmod 755 "$work/bin-$spelling/$stub"
+    done
+    printf '#!/bin/sh\necho %s\n' "$spelling" >"$work/bin-$spelling/uname"
+    chmod 755 "$work/bin-$spelling/uname"
+    env PATH="$work/bin-$spelling:$PATH" HOME="$work/home-$spelling" \
+        XDG_CONFIG_HOME="$work/home-$spelling/.config" IDE_KEEP_SERVERS=4 \
+        "$prune" -q -r "$root" --install >/dev/null 2>&1
+    out=$(env PATH="$work/bin-$spelling:$PATH" HOME="$work/home-$spelling" \
+              XDG_CONFIG_HOME="$work/home-$spelling/.config" "$prune" --install 2>&1)
+    case "$out" in
+        *"IDE_KEEP_SERVERS=4 was in the installed timer"*)
+            printf '  ok    %s: the tunable came back out of the unit\n' "$spelling" ;;
+        *) printf '  FAIL  %s: the tunable did not survive the round trip\n' "$spelling"
+           failures=$(( failures + 1 )) ;;
+    esac
+    case "$out" in
+        *"ran with --root $real_root"*)
+            printf '  ok    %s: and so did the root\n' "$spelling" ;;
+        *) printf '  FAIL  %s: the root did not survive the round trip\n' "$spelling"
+           failures=$(( failures + 1 )) ;;
+    esac
+done
+
+# Registering a launchd agent starts by unloading the one already there, and
+# bootstrap is exactly the step that fails over SSH to a headless Mac. A failure
+# there must not leave the host with no timer at all.
+printf '\na launchd registration that fails puts the previous agent back:\n'
+if [ "$(uname -s)" = Darwin ]; then
+    mkdir -p "$work/partbin" "$work/home-b"
+    cat >"$work/partbin/launchctl" <<'STUB'
+#!/bin/sh
+case $1 in
+    bootout) exit 0 ;;
+    *) exit 1 ;;
+esac
+STUB
+    chmod 755 "$work/partbin/launchctl"
+    env PATH="$work/bin:$PATH" HOME="$work/home-b" IDE_KEEP_SERVERS=3 \
+        "$prune" -q --install >/dev/null 2>&1
+    env PATH="$work/partbin:$PATH" HOME="$work/home-b" IDE_KEEP_SERVERS=9 \
+        "$prune" -q --install >/dev/null 2>&1 || true
+    plist="$work/home-b/Library/LaunchAgents/local.ide-server-prune.plist"
+    if grep -q '<string>3</string>' "$plist" 2>/dev/null; then
+        printf '  ok    the plist that was registered is back on disk\n'
+    else
+        printf '  FAIL  the failed install left its own plist in place\n'
+        failures=$(( failures + 1 ))
+    fi
+    if [ -z "$(find "$work/home-b/Library/LaunchAgents" -name '*.prev.*' 2>/dev/null)" ]; then
+        printf '  ok    no backup left behind\n'
+    else
+        printf '  FAIL  a backup plist was left behind\n'; failures=$(( failures + 1 ))
+    fi
+else
+    printf '  skip  not macOS\n'
+fi
+
 # cp writes *through* a symlink, so a link left on the installed name would send
 # the copy to whatever it points at instead of being replaced by it.
 printf '\n--install does not write through a symlink left on its name:\n'

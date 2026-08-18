@@ -11,7 +11,7 @@ shopt -s nullglob
 unset CDPATH
 
 PROGRAM_NAME=${0##*/}
-VERSION=2.6
+VERSION=2.7
 COMMIT_RE='[0-9a-f]{40}'
 ENTRY_RE='[A-Za-z][A-Za-z0-9]*-[0-9a-f]{40}(\.staging)?'
 # Every tunable, in the order the help text lists them. --install writes the
@@ -1120,9 +1120,36 @@ release_lock() {
 
 # --- scheduling ----------------------------------------------------------------
 
+# Whatever is on stdin, written to a name of its own and moved into place. A
+# unit file is read by something other than us, and one left half-written by an
+# interrupted run is one the service manager would still try to parse.
+write_file() {
+    local target=$1 staged="$1.new.$$"
+    if cat >"$staged" && mv -f -- "$staged" "$target"; then return 0; fi
+    rm -f -- "$staged"
+    return 1
+}
+
+# The version recorded in a copy of this script, read rather than executed: the
+# file on that name is not necessarily ours, and running it to ask would be a
+# strange way to find out.
+version_in_file() {
+    local line
+    line=$( { grep -m1 '^VERSION=' "$1" 2>/dev/null || true; } )
+    printf '%s' "${line#VERSION=}"
+}
+
 install_binary() {
-    local bin="$HOME/.local/bin/$PROGRAM_NAME" staged
+    local bin="$HOME/.local/bin/$PROGRAM_NAME" staged installed
     if [ ! "$SELF_PATH" -ef "$bin" ]; then
+        # Announced, and on stderr, because the caller reads this function's
+        # stdout as its return value - and because installing from an old
+        # checkout otherwise rolls the scheduled job back a version in silence.
+        installed=''
+        if [ -f "$bin" ]; then installed=$(version_in_file "$bin"); fi
+        if [ -n "$installed" ] && [ "$installed" != "$VERSION" ]; then
+            warn "replacing $bin (version $installed) with version $VERSION - the copy being run"
+        fi
         mkdir -p "$HOME/.local/bin"
         # Copied to a name of its own and moved into place, never written
         # straight onto $bin: cp writes *through* a symlink, so a link somebody
@@ -1170,6 +1197,26 @@ cron_hint() {
     done < <(root_args)
 }
 
+# Everything this invocation would schedule, in one format: NAME<tab>value per
+# tunable, then --root<tab>path per root named outright. What the unit already
+# on disk carries is read back in the same shape, so the two can be compared
+# line by line.
+desired_config() {
+    local root
+    set_tunables
+    while IFS= read -r root; do
+        [ -n "$root" ] && printf '%s\t%s\n' '--root' "$root"
+    done < <(root_args)
+    return 0
+}
+
+installed_config() {
+    case "$(uname -s)" in
+        Darwin) installed_config_launchd ;;
+        *) installed_config_systemd ;;
+    esac
+}
+
 # The timer starts from an empty environment, so whatever tunables this
 # invocation carries have to be written into the unit - otherwise --install
 # would quietly schedule a run configured differently from the one just tested.
@@ -1179,24 +1226,71 @@ report_tunables() {
         [ -n "$name" ] || continue
         [ "$shown" -eq 0 ] && say "  carrying over:"
         shown=1
-        say "    $name=$value"
-    done < <(set_tunables)
-    while IFS= read -r name; do
-        [ "$shown" -eq 0 ] && say "  carrying over:"
-        shown=1
-        say "    --root $name"
-    done < <(root_args)
+        if [ "$name" = '--root' ]; then say "    --root $value"; else say "    $name=$value"; fi
+    done < <(desired_config)
+    # Said out loud rather than left as an absence: "nothing was printed here"
+    # and "nothing was carried over" look identical on a terminal, and the second
+    # one is the interesting answer on a host that already has a timer.
+    if [ "$shown" -eq 0 ]; then
+        say "  carrying over: nothing - the scheduled run uses the built-in defaults and auto-detected roots"
+    fi
+    return 0
+}
+
+# --install regenerates the unit from the environment of *this* call, which is
+# the point: the timer is meant to describe an invocation you tried by hand, and
+# a unit that remembered settings could never be talked out of one - there would
+# be no way left to say "go back to the default". What that costs is a second
+# --install with a barer command line reverting the first one's settings without
+# a word, visible only as a "carrying over:" list that is shorter than it was.
+# So the settings the unit used to carry are read before it is rewritten, and
+# every one that this run drops or changes is named.
+report_config_drift() {
+    local previous=$1 desired=$2 line name value replacement drifted=0
+    [ -n "$previous" ] || return 0
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        case $'\n'"$desired"$'\n' in *$'\n'"$line"$'\n'*) continue ;; esac
+        name=${line%%$'\t'*}
+        value=${line#*$'\t'}
+        drifted=1
+        if [ "$name" = '--root' ]; then
+            if [ -z "$explicit_roots" ]; then
+                warn "the installed timer ran with --root $value; this run names no root, so the scheduled run reverts to auto-detected roots"
+            else
+                warn "the installed timer ran with --root $value; this run does not name that root"
+            fi
+            continue
+        fi
+        replacement=''
+        while IFS= read -r replacement; do
+            case $replacement in "$name"$'\t'*) break ;; esac
+            replacement=''
+        done <<<"$desired"
+        if [ -n "$replacement" ]; then
+            warn "$name was ${value} in the installed timer, and is ${replacement#*$'\t'} here"
+        else
+            warn "$name=$value was in the installed timer; this run does not set it, so the scheduled run falls back to the built-in default"
+        fi
+    done <<<"$previous"
+    [ "$drifted" -eq 1 ] &&
+        warn "the timer now matches this invocation - re-run --install with the earlier settings to put them back"
     return 0
 }
 
 install_timer() {
-    local bin
+    local bin previous
+    # Read before anything is written, and from the unit itself rather than from
+    # a note of our own beside it: the unit is what the service manager will
+    # actually run, and a note could only ever describe what we last wrote.
+    previous=$(installed_config)
     bin=$(install_binary)
     case "$(uname -s)" in
         Darwin) install_launchd "$bin" ;;
         *) install_systemd "$bin" ;;
     esac
     report_tunables
+    report_config_drift "$previous" "$(desired_config)"
 }
 
 uninstall_timer() {
@@ -1211,6 +1305,36 @@ systemd_unit_dir() { printf '%s/systemd/user' "${XDG_CONFIG_HOME:-$HOME/.config}
 systemd_quote() {
     local s=${1//\\/\\\\}
     printf '%s' "${s//\"/\\\"}"
+}
+
+# The inverse, and done in one left-to-right pass rather than as two successive
+# substitutions: unescaping the quotes first and the backslashes after would
+# turn a literal \" - written into the unit as \\\" - into a quote that ends the
+# value early, and the tail of the setting would be dropped on the floor.
+systemd_unquote() { sed -E 's/\\(.)/\1/g' <<<"$1"; }
+
+# What the unit on disk carries, in the format desired_config() prints. Only the
+# settings we write ourselves are read back: Environment= lines, and the --root
+# arguments of ExecStart.
+installed_config_systemd() {
+    local unit line name value
+    unit="$(systemd_unit_dir)/$PROGRAM_NAME.service"
+    [ -r "$unit" ] || return 0
+    while IFS= read -r line; do
+        line=${line#Environment=\"}
+        line=${line%\"}
+        name=${line%%=*}
+        value=${line#*=}
+        [ -n "$name" ] || continue
+        printf '%s\t%s\n' "$name" "$(systemd_unquote "$value")"
+    done < <(grep '^Environment="' "$unit" 2>/dev/null || true)
+    while IFS= read -r value; do
+        value=${value#--root \"}
+        value=${value%\"}
+        printf '%s\t%s\n' '--root' "$(systemd_unquote "$value")"
+    done < <( { grep -m1 '^ExecStart=' "$unit" 2>/dev/null || true; } |
+        { grep -oE -- '--root "([^"\]|\\.)*"' || true; } )
+    return 0
 }
 
 systemd_environment() {
@@ -1252,9 +1376,10 @@ IOSchedulingClass=idle
 EOF
         systemd_environment
         systemd_exec_start "$bin"
-    } >"$units/$PROGRAM_NAME.service"
+    } | write_file "$units/$PROGRAM_NAME.service" ||
+        die "could not write $units/$PROGRAM_NAME.service"
 
-    cat >"$units/$PROGRAM_NAME.timer" <<EOF
+    write_file "$units/$PROGRAM_NAME.timer" <<EOF || die "could not write $units/$PROGRAM_NAME.timer"
 [Unit]
 Description=Daily prune of stale remote IDE server installs
 
@@ -1298,6 +1423,38 @@ xml_escape() {
     printf '%s' "$s"
 }
 
+# The inverse, and the ampersand last: undoing it first would turn the &amp;lt;
+# that stands for a literal "&lt;" back into a "<" the value never contained.
+xml_unescape() {
+    local s=$1
+    s=${s//&lt;/<}
+    s=${s//&gt;/>}
+    s=${s//&amp;/&}
+    printf '%s' "$s"
+}
+
+# The plist counterpart of installed_config_systemd(). Every setting we write
+# occupies a line of its own, so the shape is fixed and the tunables are looked
+# up by name rather than by parsing the file as XML.
+installed_config_launchd() {
+    local plist line name value
+    plist=$(launchd_plist)
+    [ -r "$plist" ] || return 0
+    for name in $TUNABLE_VARS; do
+        line=$( { grep -m1 -F "<key>$name</key>" "$plist" 2>/dev/null || true; } )
+        [ -n "$line" ] || continue
+        value=${line#*<string>}
+        value=${value%%</string>*}
+        printf '%s\t%s\n' "$name" "$(xml_unescape "$value")"
+    done
+    while IFS= read -r line; do
+        value=${line#*'--root</string><string>'}
+        value=${value%%</string>*}
+        printf '%s\t%s\n' '--root' "$(xml_unescape "$value")"
+    done < <(grep -F -- '<string>--root</string><string>' "$plist" 2>/dev/null || true)
+    return 0
+}
+
 launchd_root_args() {
     local root
     while IFS= read -r root; do
@@ -1317,10 +1474,20 @@ launchd_environment() {
 }
 
 install_launchd() {
-    local bin=$1 plist label
+    local bin=$1 plist label backup=''
     label=$(launchd_label)
     plist=$(launchd_plist)
     mkdir -p "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
+
+    # Registering the new agent means unloading the one already there, and
+    # bootstrap is exactly the step that fails on a headless host with nobody
+    # logged in at the console. Without a copy of the plist that was working a
+    # moment ago there would be nothing to put back, and an --install that
+    # failed would have taken the working timer with it.
+    if [ -f "$plist" ]; then
+        backup="$plist.prev.$$"
+        cp -f -- "$plist" "$backup" 2>/dev/null || backup=''
+    fi
 
     {
         cat <<EOF
@@ -1353,14 +1520,33 @@ EOF
 </dict>
 </plist>
 EOF
-    } >"$plist"
+    } | write_file "$plist" || die "could not write $plist"
 
     launchctl bootout "gui/$UID_SELF/$label" >/dev/null 2>&1 || true
-    if ! launchctl bootstrap "gui/$UID_SELF" "$plist" 2>/dev/null; then
-        launchctl load -w "$plist" 2>/dev/null ||
-            die "could not load $plist; add a cron entry instead: $(cron_hint "$bin")"
+    if ! launchctl bootstrap "gui/$UID_SELF" "$plist" 2>/dev/null &&
+       ! launchctl load -w "$plist" 2>/dev/null; then
+        restore_launchd "$backup" "$plist"
+        die "could not load $plist; add a cron entry instead: $(cron_hint "$bin")"
     fi
+    [ -n "$backup" ] && rm -f -- "$backup"
     say "installed $bin and loaded $label (daily 04:30, log in ~/Library/Logs/$PROGRAM_NAME.log)"
+}
+
+# Put back the agent that was registered before this call, so a registration
+# that fails leaves the host with the timer it already had rather than with
+# none. Only reached on the path that ends in die(), so the message about the
+# cron line arrives after the state has been settled.
+restore_launchd() {
+    local backup=$1 plist=$2
+    [ -n "$backup" ] && [ -f "$backup" ] || return 0
+    mv -f -- "$backup" "$plist" 2>/dev/null || { rm -f -- "$backup"; return 0; }
+    if launchctl bootstrap "gui/$UID_SELF" "$plist" 2>/dev/null ||
+       launchctl load -w "$plist" 2>/dev/null; then
+        warn "the timer installed before this call has been put back"
+    else
+        warn "the timer installed before this call could not be loaded again either"
+    fi
+    return 0
 }
 
 uninstall_launchd() {
